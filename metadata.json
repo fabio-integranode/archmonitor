@@ -8,7 +8,7 @@
         "Id": "io.arquimedes.archimonitor",
         "License": "MIT",
         "Name": "Archmonitor",
-        "Version": "1.7.2"
+        "Version": "1.8.0"
     },
     "X-Plasma-API-Minimum-Version": "6.0"
 }

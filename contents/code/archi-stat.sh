@@ -2,17 +2,20 @@
 # archi-stat — one-pass telemetry snapshot for Archmonitor, JSON on stdout.
 #
 #   archi-stat.sh        fast probe (every 2 s): CPU, mem, thermals, GPU, disk, net, battery
-#   archi-stat.sh sec    slow probe (every 30 s): LUKS on /, UFW, USBGuard, reboot pending
+#   archi-stat.sh sec    slow probe (every 30 s): LUKS on /, firewall, USBGuard, reboot pending
 #   archi-stat.sh top    on-demand (~1 s): top consumers by CPU and RSS, grouped by command
 #   archi-stat.sh kill SIG NAME PID...   SIGTERM/SIGKILL to the listed PIDs, re-validated
 #   archi-stat.sh media                  what a browser is playing (MPRIS, via playerctl)
 #   archi-stat.sh media-ctl ACTION PLAYER   play-pause | next | previous | raise
 #
-# Reads /proc and /sys directly. External tools per fast tick: stat(1) and,
-# on Wi-Fi, iw(8). No lm_sensors, no awk, no cat. ~9 ms per run.
+# Reads /proc and /sys directly. External tools per fast tick: stat(1), iw(8) on Wi-Fi
+# when installed, nvidia-smi only while an NVIDIA card is awake. No lm_sensors, no awk,
+# no cat. ~10 ms per run.
 #
-# Test hooks (never set in production): ARCHI_SYSBLK, ARCHI_ROOT_DEV, ARCHI_MODDIR,
-# ARCHI_ROUTE (a /proc/net/route file), ARCHI_IW_FILE (canned `iw dev X link` output),
+# Test hooks (never set in production): ARCHI_SYS (a fake /sys root for the fast probe),
+# ARCHI_SYSBLK, ARCHI_ROOT_DEV, ARCHI_MODDIR, ARCHI_SYSTEMCTL, ARCHI_NVSMI (stand-ins for
+# those commands), ARCHI_ROUTE (a /proc/net/route file), ARCHI_IW_FILE (canned
+# `iw dev X link` output), ARCHI_WIRELESS (a /proc/net/wireless file),
 # ARCHI_MEDIA_FILE (canned `playerctl -a metadata` output).
 
 set -u
@@ -78,9 +81,15 @@ luks_backed() {
 # running, or when the running kernel's module tree was removed by an upgrade. Returns
 # false (quiet) when it can't tell, e.g. a kernel not installed from an Arch package.
 reboot_pending() {
-    local run base cand cb newest
+    local run base cand cb newest p
     rs run /proc/sys/kernel/osrelease || return 1
-    [[ -d $MODDIR/$run ]] || return 0
+    if [[ ! -d $MODDIR/$run ]]; then
+        # Modules gone: an upgrade removed them — but only claim that on a system whose
+        # kernels come from Arch packages (a pkgbase file somewhere). Elsewhere the module
+        # tree may simply live in another place (NixOS, containers).
+        for p in "$MODDIR"/*/pkgbase; do return 0; done
+        return 1
+    fi
     rs base "$MODDIR/$run/pkgbase" || return 1
     newest=$run
     for cand in "$MODDIR"/*/; do
@@ -92,6 +101,45 @@ reboot_pending() {
     [[ $newest != "$run" ]]
 }
 
+# svc_states UNIT... — one state per unit, in order, on stdout:
+#   active   running (a oneshot that stays active after exit, like ufw.service, counts)
+#   down     enabled or failed, yet not running: a real fault
+#   off      installed but neither enabled nor running: the owner's choice
+#   absent   not installed
+#   unknown  systemctl could not answer (no bus, timeout)
+# `systemctl is-active` cannot tell "not installed" from "stopped" (both print inactive),
+# which is why this reads LoadState and UnitFileState too.
+SYSTEMCTL=${ARCHI_SYSTEMCTL:-systemctl}
+svc_states() {
+    local k v load="" act="" ufs="" s
+    local -a out=()
+    while IFS='=' read -r k v; do
+        case $k in
+            LoadState) load=$v ;;
+            ActiveState) act=$v ;;
+            UnitFileState) ufs=$v ;;
+            "")
+                [[ -n $load ]] || continue
+                case $load in
+                    not-found) s=absent ;;
+                    masked) s=off ;;
+                    loaded)
+                        case $act in
+                            active|reloading|activating|deactivating) s=active ;;
+                            failed) s=down ;;
+                            *) [[ $ufs == enabled* ]] && s=down || s=off ;;
+                        esac ;;
+                    *) s=unknown ;;
+                esac
+                out+=("$s"); load="" act="" ufs="" ;;
+        esac
+    done < <("$SYSTEMCTL" show -p LoadState -p ActiveState -p UnitFileState -- "$@" 2>/dev/null; echo)
+    if (( ${#out[@]} != $# )); then
+        out=(); for k; do out+=(unknown); done
+    fi
+    printf '%s\n' "${out[@]}"
+}
+
 if [[ ${1:-} == sec ]]; then
     # luks: true / false, or null when the device behind / cannot be resolved.
     luks=null reboot=false kernel=""
@@ -101,9 +149,23 @@ if [[ ${1:-} == sec ]]; then
     fi
     reboot_pending && reboot=true
     rs kernel /proc/sys/kernel/osrelease
-    mapfile -t st < <(systemctl is-active ufw.service usbguard.service 2>/dev/null)
-    printf '{"luks":%s,"ufw":%s,"usbguard":%s,"reboot":%s,"kernel":%s}\n' \
-        "$luks" "$(js "${st[0]:-unknown}")" "$(js "${st[1]:-unknown}")" "$reboot" "$(js "$kernel")"
+    # Firewall: whichever front end is in use. One running wins; else one that should run
+    # (enabled or failed) is reported down. Installed-but-unused units say nothing about
+    # intent (iptables.service and nftables.service ship with common packages), so they
+    # only make the firewall "off", without a name.
+    fws=(ufw firewalld nftables iptables)
+    mapfile -t st < <(svc_states ufw.service firewalld.service nftables.service iptables.service usbguard.service)
+    fw=absent fw_name=""
+    for want in active down off unknown; do
+        for i in 0 1 2 3; do
+            [[ ${st[i]} == "$want" ]] || continue
+            fw=$want
+            [[ $want == active || $want == down ]] && fw_name=${fws[i]}
+            break 2
+        done
+    done
+    printf '{"luks":%s,"fw":%s,"fw_name":%s,"usbguard":%s,"reboot":%s,"kernel":%s}\n' \
+        "$luks" "$(js "$fw")" "$(js "$fw_name")" "$(js "${st[4]}")" "$reboot" "$(js "$kernel")"
     exit 0
 fi
 
@@ -315,11 +377,43 @@ if [[ ${1:-} == top ]]; then
 fi
 
 # ── Fast probe ───────────────────────────────────────────────────────────────
+# Hardware differs from machine to machine, so every sensor is found by what its driver
+# is called, never by index or by this author's laptop. Each figure that has a source
+# also reports which one (`src`), so `archi-stat.sh | jq .src` explains a blank row.
 ts=${EPOCHREALTIME//[.,]/}          # µs; locale-proof (es_AR uses a comma)
+SYS=${ARCHI_SYS:-/sys}
 
-host=archi model=""
+host=""
 rs host /proc/sys/kernel/hostname
-rs model /sys/class/dmi/id/product_version
+
+# Model. Firmware fills DMI fields carelessly, so placeholders are skipped. Lenovo puts
+# the marketing name in product_version (product_name is a machine type like 21XX…);
+# everyone else uses product_name; self-built desktops only fill the board fields; ARM
+# boards have none of it and name themselves in the device tree.
+junk_dmi() {
+    local LC_ALL=C v=${1,,}
+    v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+    case $v in
+        ""|none|n/a|na|"not applicable"|"not specified"|"not available"|"to be filled by o.e.m."|\
+        "to be filled by oem"|"system product name"|"system version"|"system manufacturer"|\
+        "default string"|invalid|o.e.m.|oem|0|1.0|0.1|x.x|123456789|"type1productconfigid") return 0 ;;
+    esac
+    return 1
+}
+dmi=$SYS/class/dmi/id
+model="" vendor="" pname="" pver="" bname=""
+rs vendor "$dmi/sys_vendor"; rs pname "$dmi/product_name"; rs pver "$dmi/product_version"
+if [[ ${vendor^^} == LENOVO* ]] && ! junk_dmi "$pver"; then
+    model=$pver
+elif ! junk_dmi "$pname"; then
+    model=$pname
+elif rs bname "$dmi/board_name" && ! junk_dmi "$bname"; then
+    model=$bname                    # the board name alone is specific enough ("ROG STRIX B550-F GAMING")
+else
+    { IFS= read -r -d '' model < "$SYS/firmware/devicetree/base/model"; } 2>/dev/null
+    [[ $model =~ ^(.*[^ ])\ Rev\ [0-9.]+$ ]] && model=${BASH_REMATCH[1]}   # "Raspberry Pi 5 Model B Rev 1.0"
+fi
+model=${model#"${model%%[![:space:]]*}"}; model=${model%"${model##*[![:space:]]}"}
 
 read -r up_ _ < /proc/uptime; uptime=${up_:-0}; uptime=${uptime%%[.,]*}   # field 1; field 2 is idle time summed over all CPUs
 read -r _ u n s i w q sq st _ < /proc/stat
@@ -334,25 +428,137 @@ while read -r k v _; do
     esac
 done < /proc/meminfo
 
+# temp_by_label DIR VAR LABEL... — VAR from the first tempN of DIR whose label matches,
+# trying the labels in the order given.
+temp_by_label() {
+    local dir=$1 var=$2 want l f
+    shift 2
+    for want; do
+        for f in "$dir"/temp*_label; do
+            rs l "$f" && [[ $l == "$want" ]] || continue
+            rd "$var" "${f%_label}_input" && return 0
+        done
+    done
+    return 1
+}
+
 # hwmon, matched by driver name — hwmonN indices are not stable across boots.
-cpu_t=null gpu_t=null gpu_w=null gpu_cap=null gpu_f=null ssd_t=null fan=null
-for h in /sys/class/hwmon/hwmon*; do
+#   CPU   k10temp / zenpower (AMD: Tdie, which excludes the fan-curve offset some parts add
+#         to Tctl, else Tctl), coretemp (Intel: the package sensor), the SoC sensor of
+#         ARM boards. acpitz is deliberately not used: on many laptops it is a board or EC
+#         zone, sometimes a constant, and a wrong CPU temperature is worse than none.
+#   GPU   amdgpu (the first one that answers: a sleeping dGPU fails its reads without
+#         being woken, so an APU next to it is picked), nouveau.
+#   SSD   nvme (Composite), else drivetemp (SATA; needs `modprobe drivetemp`).
+#   FAN   the fastest fan any driver reports (thinkpad, dell_smm, asus, nct67xx, it87…).
+cpu_t=null cpu_src="" gpu_t=null gpu_busy=null gpu_f=null gpu_fmax=null gpu_src="" gpu_state=""
+pwr=null pwr_cap=null pwr_kind="" ssd_t=null ssd_src="" ssd_rank=0 fan=null fan_src=""
+nv_t=null
+for h in "$SYS"/class/hwmon/hwmon*; do
     rs name "$h/name" || continue
+    v=""
     case $name in
-        k10temp)  rd cpu_t "$h/temp1_input" ;;                       # Tctl
-        amdgpu)   rd gpu_t "$h/temp1_input"                           # edge
-                  rd gpu_w "$h/power1_average" || rd gpu_w "$h/power1_input"   # PPT (SoC package), µW
-                  rd gpu_cap "$h/power1_cap"
-                  rd gpu_f "$h/freq1_input" ;;                        # sclk, Hz
-        nvme)     [[ $ssd_t == null ]] && rd ssd_t "$h/temp1_input" ;; # Composite
-        thinkpad) rd fan "$h/fan1_input" ;;
+        k10temp|zenpower)
+            [[ -z $cpu_src ]] && { temp_by_label "$h" v Tdie Tctl || rd v "$h/temp1_input"; } && { cpu_t=$v; cpu_src=$name; } ;;
+        coretemp)
+            [[ -z $cpu_src ]] && { temp_by_label "$h" v "Package id 0" || rd v "$h/temp1_input"; } && { cpu_t=$v; cpu_src=$name; } ;;
+        cpu_thermal|cpu-thermal|cpu0_thermal|soc_thermal|soc-thermal)
+            [[ -z $cpu_src ]] && rd v "$h/temp1_input" && { cpu_t=$v; cpu_src=$name; } ;;
+        amdgpu)
+            if [[ $gpu_src != amdgpu ]]; then
+                t_=null b_=null
+                rd t_ "$h/temp1_input"                                   # edge
+                rd b_ "$h/device/gpu_busy_percent"
+                if [[ $t_ != null || $b_ != null ]]; then
+                    gpu_t=$t_ gpu_busy=$b_ gpu_src=amdgpu
+                    rd v "$h/freq1_input" && gpu_f=$(( v / 1000000 ))   # sclk, Hz → MHz
+                    if rd pwr "$h/power1_average" || rd pwr "$h/power1_input"; then
+                        rd pwr_cap "$h/power1_cap"
+                        # An APU's sensor covers the whole package (PPT); a discrete card's,
+                        # its board. sysfs has no APU flag, but only APUs expose vddnb
+                        # (in1_input); a cap under 60 W is taken as a second sign.
+                        pwr_kind=gpu
+                        if [[ -e $h/in1_input ]] || { [[ $pwr_cap != null ]] && (( pwr_cap < 60000000 )); }; then
+                            pwr_kind=soc
+                        fi
+                    fi
+                fi
+            fi ;;
+        nouveau)
+            rd nv_t "$h/temp1_input" ;;
+        nvme)
+            (( ssd_rank < 2 )) && rd v "$h/temp1_input" && { ssd_t=$v; ssd_src=nvme; ssd_rank=2; } ;;   # Composite
+        drivetemp)
+            (( ssd_rank < 1 )) && rd v "$h/temp1_input" && { ssd_t=$v; ssd_src=drivetemp; ssd_rank=1; } ;;
     esac
+    for f in "$h"/fan[0-9]*_input; do
+        rd v "$f" || continue
+        if [[ $fan == null ]] || (( v > fan )); then fan=$v; fan_src=$name; fi
+    done
 done
 
-gpu_busy=null
-for f in /sys/class/drm/card[0-9]/device/gpu_busy_percent /sys/class/drm/card[0-9][0-9]/device/gpu_busy_percent; do
-    rd gpu_busy "$f" && break
+# CPU fallback: the package thermal zone (Intel without coretemp, some ARM SoCs).
+if [[ -z $cpu_src ]]; then
+    for z in "$SYS"/class/thermal/thermal_zone*; do
+        rs ty "$z/type" || continue
+        case $ty in
+            x86_pkg_temp|cpu-thermal|cpu_thermal|cpu0-thermal|soc_thermal|soc-thermal)
+                v=""; rd v "$z/temp" && { cpu_t=$v; cpu_src=$ty; break; } ;;
+        esac
+    done
+fi
+
+# Intel graphics: no busy % in sysfs (that needs perf counters), but the actual GPU clock
+# against its maximum is a fair load gauge, and 0 MHz means it is power-gated (RC6).
+i_f=null i_max=null i_src=""
+for c in "$SYS"/class/drm/card[0-9] "$SYS"/class/drm/card[0-9][0-9]; do
+    if rd i_f "$c/gt_act_freq_mhz"; then
+        rd i_max "$c/gt_RP0_freq_mhz" || rd i_max "$c/gt_max_freq_mhz"; i_src=i915; break
+    elif rd i_f "$c/device/tile0/gt0/freq0/act_freq"; then
+        rd i_max "$c/device/tile0/gt0/freq0/rp0_freq" || rd i_max "$c/device/tile0/gt0/freq0/max_freq"; i_src=xe; break
+    fi
 done
+
+# NVIDIA's proprietary driver has no hwmon, only nvidia-smi — and on hybrid laptops the
+# card spends most of its time asleep (runtime D3). Querying it would wake it every 2 s
+# and cost real battery, so a sleeping card is reported as asleep and left alone.
+nv_dev="" nv_sleep=false
+for d in "$SYS"/bus/pci/drivers/nvidia/0000:*; do
+    s_=""; rs s_ "$d/power/runtime_status"
+    if [[ $s_ == suspended ]]; then nv_sleep=true; else nv_dev=$d; nv_sleep=false; break; fi
+done
+NVSMI=${ARCHI_NVSMI:-nvidia-smi}
+uw() {   # uw VAR WATTS — decimal watts ("18.4") to integer µW, without a subshell
+    local i=${2%%.*} f=""
+    [[ $2 == *.* ]] && f=${2#*.}
+    f=${f}000000
+    printf -v "$1" '%s' $(( 10#$i * 1000000 + 10#${f:0:6} ))
+}
+n_busy=null n_t=null n_w=null n_cap=null a_="" b_="" c_="" d_=""
+if [[ -n $nv_dev ]] && command -v "$NVSMI" >/dev/null 2>&1; then
+    IFS=', ' read -r a_ b_ c_ d_ < <("$NVSMI" --query-gpu=utilization.gpu,temperature.gpu,power.draw,power.limit \
+        --format=csv,noheader,nounits -i 0 2>/dev/null)
+    [[ $a_ =~ ^[0-9]+$ ]] && n_busy=$a_
+    [[ $b_ =~ ^[0-9]+$ ]] && n_t=$(( b_ * 1000 ))
+    [[ $c_ =~ ^[0-9]+(\.[0-9]+)?$ ]] && uw n_w "$c_"
+    [[ $d_ =~ ^[0-9]+(\.[0-9]+)?$ ]] && uw n_cap "$d_"
+fi
+
+# Which GPU the card shows: an awake NVIDIA card (it is where the work is), else AMD,
+# else Intel, else nouveau, else a sleeping NVIDIA card as "sleep".
+if [[ $n_busy != null || $n_t != null ]]; then
+    gpu_src=nvidia gpu_busy=$n_busy gpu_t=$n_t gpu_f=null gpu_fmax=null
+    # Package power from an APU stays: it says more than the dGPU's board power.
+    [[ $pwr_kind == soc ]] || { [[ $n_w != null ]] && { pwr=$n_w pwr_cap=$n_cap pwr_kind=gpu; }; }
+elif [[ $gpu_src == amdgpu ]]; then
+    :
+elif [[ -n $i_src ]]; then
+    gpu_src=$i_src gpu_f=$i_f gpu_fmax=$i_max
+elif [[ $nv_t != null ]]; then
+    gpu_src=nouveau gpu_t=$nv_t
+elif [[ $nv_sleep == true || -n $nv_dev ]]; then
+    gpu_src=nvidia; [[ $nv_sleep == true ]] && gpu_state=sleep
+fi
 
 read -r fs_blocks fs_free fs_avail fs_bsize < <(stat -f -c '%b %f %a %S' / 2>/dev/null)
 
@@ -367,9 +573,9 @@ while read -r ifc dst _ flags _ _ metric mask _; do
     if [[ -z $best ]] || (( metric < best )); then iface=$ifc; best=$metric; fi
 done < "${ARCHI_ROUTE:-/proc/net/route}"
 if [[ -n $iface ]]; then
-    rd rx "/sys/class/net/$iface/statistics/rx_bytes"
-    rd tx "/sys/class/net/$iface/statistics/tx_bytes"
-    if [[ -n ${ARCHI_IW_FILE:-} || -e /sys/class/net/$iface/phy80211 ]]; then
+    rd rx "$SYS/class/net/$iface/statistics/rx_bytes"
+    rd tx "$SYS/class/net/$iface/statistics/tx_bytes"
+    if [[ -n ${ARCHI_IW_FILE:-} ]] || { [[ -e $SYS/class/net/$iface/phy80211 ]] && command -v iw >/dev/null; }; then
         if [[ -n ${ARCHI_IW_FILE:-} ]]; then exec 3< "$ARCHI_IW_FILE"; else exec 3< <(iw dev "$iface" link 2>/dev/null); fi
         while IFS= read -r line <&3; do
             line=${line#"${line%%[![:space:]]*}"}
@@ -383,20 +589,38 @@ if [[ -n $iface ]]; then
         # so "Señal" arrives as "Se\xc3\xb1al". Decode it back to UTF-8.
         [[ $ssid == *'\x'* ]] && printf -v ssid '%b' "$ssid"
         [[ $sig =~ ^-?[0-9]+$ ]] || sig=null
+    elif [[ -e $SYS/class/net/$iface/phy80211 || -n ${ARCHI_WIRELESS:-} ]]; then
+        # Without iw(8): the signal level from /proc/net/wireless; the SSID stays unknown
+        # and the card names the interface instead.
+        while read -r ifc _ _ lvl _; do
+            [[ ${ifc%:} == "$iface" ]] || continue
+            lvl=${lvl%.}; [[ $lvl =~ ^-[0-9]+$ ]] && sig=$lvl
+        done < "${ARCHI_WIRELESS:-/proc/net/wireless}"
     fi
 fi
 
-# Battery: first BAT* present.
-bat_cap=null bat_status="" bat_power=null bat_energy=null bat_full=null bat_limit=null
-for b in /sys/class/power_supply/BAT*; do
-    rd bat_cap "$b/capacity"
+# Battery: the first system battery. Peripherals (mice, headsets) are power supplies too
+# but carry scope=Device. Drivers report either energy (µWh) or charge (µAh); charge is
+# converted with the design voltage, and power is unsigned whatever the driver's sign.
+bat_cap=null bat_status="" bat_power=null bat_energy=null bat_full=null bat_limit=null bat_src=""
+for b in "$SYS"/class/power_supply/*; do
+    ty="" sc=""
+    rs ty "$b/type" && [[ $ty == Battery ]] || continue
+    rs sc "$b/scope" && [[ $sc == Device ]] && continue
+    rd bat_cap "$b/capacity" || continue
+    bat_src=${b##*/}
     rs bat_status "$b/status"
     if ! rd bat_power "$b/power_now"; then
         cur=0 vol=0
-        rd cur "$b/current_now" && rd vol "$b/voltage_now" && bat_power=$((cur * vol / 1000000))
+        rd cur "$b/current_now" && rd vol "$b/voltage_now" && bat_power=$(( cur * vol / 1000000 ))
     fi
-    rd bat_energy "$b/energy_now"
-    rd bat_full "$b/energy_full"
+    [[ $bat_power != null ]] && bat_power=${bat_power#-}
+    if ! { rd bat_energy "$b/energy_now" && rd bat_full "$b/energy_full"; }; then
+        bat_energy=null bat_full=null cn=0 cf=0 vd=0
+        if rd cn "$b/charge_now" && rd cf "$b/charge_full" && { rd vd "$b/voltage_min_design" || rd vd "$b/voltage_now"; }; then
+            bat_energy=$(( cn * vd / 1000000 )) bat_full=$(( cf * vd / 1000000 ))
+        fi
+    fi
     rd bat_limit "$b/charge_control_end_threshold"
     break
 done
@@ -404,9 +628,13 @@ done
 printf '{"ts":%s,"host":%s,"model":%s,"uptime":%s,' "$ts" "$(js "$host")" "$(js "$model")" "$uptime"
 printf '"cpu_total":%s,"cpu_idle":%s,"cpu_temp":%s,' "$cpu_total" "$cpu_idle" "$cpu_t"
 printf '"mem_total":%s,"mem_avail":%s,' "$mem_total" "$mem_avail"
-printf '"gpu_busy":%s,"gpu_temp":%s,"gpu_freq":%s,"soc_power":%s,"soc_cap":%s,' "$gpu_busy" "$gpu_t" "$gpu_f" "$gpu_w" "$gpu_cap"
+printf '"gpu_busy":%s,"gpu_temp":%s,"gpu_freq":%s,"gpu_freq_max":%s,"gpu_state":%s,' \
+    "$gpu_busy" "$gpu_t" "$gpu_f" "$gpu_fmax" "$(js "$gpu_state")"
+printf '"soc_power":%s,"soc_cap":%s,"power_kind":%s,' "$pwr" "$pwr_cap" "$(js "$pwr_kind")"
 printf '"ssd_temp":%s,"fan":%s,' "$ssd_t" "$fan"
 printf '"fs_blocks":%s,"fs_free":%s,"fs_avail":%s,"fs_bsize":%s,' "${fs_blocks:-0}" "${fs_free:-0}" "${fs_avail:-0}" "${fs_bsize:-0}"
 printf '"iface":%s,"rx":%s,"tx":%s,"ssid":%s,"signal":%s,' "$(js "$iface")" "$rx" "$tx" "$(js "$ssid")" "$sig"
-printf '"bat_cap":%s,"bat_status":%s,"bat_power":%s,"bat_energy":%s,"bat_full":%s,"bat_limit":%s}\n' \
+printf '"bat_cap":%s,"bat_status":%s,"bat_power":%s,"bat_energy":%s,"bat_full":%s,"bat_limit":%s,' \
     "$bat_cap" "$(js "$bat_status")" "$bat_power" "$bat_energy" "$bat_full" "$bat_limit"
+printf '"src":{"cpu":%s,"gpu":%s,"ssd":%s,"fan":%s,"bat":%s}}\n' \
+    "$(js "$cpu_src")" "$(js "$gpu_src")" "$(js "$ssd_src")" "$(js "$fan_src")" "$(js "$bat_src")"

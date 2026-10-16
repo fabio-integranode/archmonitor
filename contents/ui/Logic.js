@@ -27,6 +27,8 @@ function sev(v, t, lowIsBad) {
 }
 
 function degC(milli) { return has(milli) ? Math.round(milli / 1000) + "°C" : "—"; }
+// For sensors a machine may simply not have: blank instead of a dash.
+function degOpt(milli) { return has(milli) ? degC(milli) : ""; }
 function celsius(milli) { return has(milli) ? milli / 1000 : NaN; }
 
 function pct(v) { return has(v) && v >= 0 ? Math.round(v) + "%" : "—"; }
@@ -134,23 +136,34 @@ var RULES = [
     { key: "socHi", th: [15, 1e9],   margin: 3,   silent: true, val: function (c) { return has(c.s.soc_power) ? c.s.soc_power / 1e6 : NaN; } }
 ];
 
-// "unknown" from systemctl means it could not tell (no bus, timeout): that is not "down".
-function svcDown(st) { return st !== "active" && st !== "unknown"; }
+// Security policy. Services come from the probe as active / down / off / absent / unknown
+// ("down" = enabled or failed yet not running, "off" = installed and unused, "absent" =
+// not installed). A service that should be running and is not always alerts. What a
+// machine is *required* to have is its owner's call (settings → Security): only then do
+// "off", "absent", an unencrypted / or an answer nobody could get raise an alert.
+//   pol = { luks: bool, fw: bool, usbguard: bool }
+function svcFault(st, required) {
+    return st === "down" || (!!required && (st === "off" || st === "absent"));
+}
+function fwText(c) { return c.sec.fw_name ? c.sec.fw_name.toUpperCase() + " DOWN" : "NO FIREWALL"; }
 
-// Only two absences block NOMINAL: the CPU temperature (the real thermal guard) and the
-// security probe. A missing GPU/SSD temperature, fan or signal just shows "—".
+// What blocks NOMINAL besides measured values: no uplink, a CPU temperature sensor that
+// was there and stopped answering (a machine that never had one just shows "—"), the
+// security probe going quiet, and the security findings above.
 var FLAGS = [
     { key: "offline", text: "OFFLINE",        cond: function (c) { return !c.s.iface; } },
-    { key: "cpuTunk", text: "CPU TEMP ?",     short: "CPU °C ?", kind: "unknown", cond: function (c) { return !has(c.s.cpu_temp); } },
+    { key: "cpuTunk", text: "CPU TEMP ?",     short: "CPU °C ?", kind: "unknown", cond: function (c) { return c.cpuSeen && !has(c.s.cpu_temp); } },
     { key: "secunk",  text: "SECURITY ?",     kind: "unknown", cond: function (c) { return !c.secFresh; } },
-    { key: "luks",    text: "LUKS OFF",       cond: function (c) { return c.secFresh && c.sec.luks === false; } },
-    { key: "luksunk", text: "LUKS ?",         kind: "unknown", cond: function (c) { return c.secFresh && c.sec.luks !== true && c.sec.luks !== false; } },
-    { key: "ufw",     text: "UFW DOWN",       cond: function (c) { return c.secFresh && svcDown(c.sec.ufw); } },
-    { key: "ufwunk",  text: "UFW ?",          kind: "unknown", cond: function (c) { return c.secFresh && c.sec.ufw === "unknown"; } },
-    { key: "usbg",    text: "USBGUARD DOWN",  short: "USBGUARD", cond: function (c) { return c.secFresh && svcDown(c.sec.usbguard); } },
-    { key: "usbgunk", text: "USBGUARD ?",     kind: "unknown", cond: function (c) { return c.secFresh && c.sec.usbguard === "unknown"; } },
+    { key: "luks",    text: "LUKS OFF",       cond: function (c) { return c.secFresh && c.pol.luks && c.sec.luks === false; } },
+    { key: "luksunk", text: "LUKS ?",         kind: "unknown", cond: function (c) { return c.secFresh && c.pol.luks && c.sec.luks !== true && c.sec.luks !== false; } },
+    { key: "fw",      text: fwText,           short: function (c) { return c.sec.fw_name === "ufw" ? "UFW DOWN" : c.sec.fw_name ? "FW DOWN" : "NO FW"; },
+                      cond: function (c) { return c.secFresh && svcFault(c.sec.fw, c.pol.fw); } },
+    { key: "fwunk",   text: "FIREWALL ?",     kind: "unknown", cond: function (c) { return c.secFresh && c.pol.fw && c.sec.fw === "unknown"; } },
+    { key: "usbg",    text: "USBGUARD DOWN",  short: "USBGUARD", cond: function (c) { return c.secFresh && svcFault(c.sec.usbguard, c.pol.usbguard); } },
+    { key: "usbgunk", text: "USBGUARD ?",     kind: "unknown", cond: function (c) { return c.secFresh && c.pol.usbguard && c.sec.usbguard === "unknown"; } },
     { key: "reboot",  text: "REBOOT PENDING", short: "REBOOT", cond: function (c) { return c.secFresh && c.sec.reboot === true; } }
 ];
+function txt(v, c) { return typeof v === "function" ? v(c) : v; }
 
 // Highest level <= cur whose threshold the value is still within `margin` of.
 function held(v, th, low, margin, cur) {
@@ -189,15 +202,18 @@ function stepFlag(st, f, on) {
     return st.lv[f.key] || 0;
 }
 
-function freshState() { return { lv: {}, pend: {}, pmin: {} }; }
+function freshState() { return { lv: {}, pend: {}, pmin: {}, seen: {} }; }
 
 // One sample in; { levels: {key: 0|1|2}, list: [{key, kind, sev, text, short}] worst first } out.
 // secAgeMs: time since the security snapshot arrived; omitted means fresh.
-function evaluate(st, s, sec, secAgeMs) {
+// pol: the security policy (see svcFault); omitted means nothing is required.
+function evaluate(st, s, sec, secAgeMs, pol) {
     var d = derive(s);
     if (!d.live) return { levels: {}, list: [] };
-    var fresh = !!sec && sec.ufw !== undefined && !(secAgeMs > SEC_STALE_MS);
-    var c = { s: s, sec: sec || {}, d: d, secFresh: fresh };
+    if (!st.seen) st.seen = {};
+    if (has(s.cpu_temp)) st.seen.cpu = true;
+    var fresh = secValid(sec) && !(secAgeMs > SEC_STALE_MS);
+    var c = { s: s, sec: sec || {}, d: d, secFresh: fresh, pol: pol || {}, cpuSeen: !!st.seen.cpu };
     var list = [], i, lvl, t;
     for (i = 0; i < RULES.length; i++) {
         lvl = stepRule(st, RULES[i], RULES[i].val(c));
@@ -210,8 +226,9 @@ function evaluate(st, s, sec, secAgeMs) {
         lvl = stepFlag(st, FLAGS[i], FLAGS[i].cond(c));
         if (lvl > 0) {
             var kind = FLAGS[i].kind || "warn";
+            var tx = txt(FLAGS[i].text, c);
             list.push({ key: FLAGS[i].key, kind: kind, sev: kind === "warn" ? 1 : 0,
-                        text: FLAGS[i].text, short: FLAGS[i].short || FLAGS[i].text, i: RULES.length + i });
+                        text: tx, short: FLAGS[i].short ? txt(FLAGS[i].short, c) : tx, i: RULES.length + i });
         }
     }
     list.sort(function (a, b) { return RANK[b.kind] - RANK[a.kind] || a.i - b.i; });
@@ -230,15 +247,62 @@ function present(list, fastAgeMs) {
     return [{ key: "stale", kind: "stale", sev: 0, text: t, short: t }].concat(list);
 }
 
+// A security snapshot in the current format (the probe and the views ship together, but
+// an old probe still running after an upgrade must read as unknown, not as all clear).
+function secValid(sec) { return !!sec && sec.fw !== undefined; }
+
+// The security row: one dot per check. tone: ok (running / encrypted), bad (a fault, or
+// a requirement not met), off (not in use, not required: shown, quiet), unk (cannot
+// tell). USBGuard is left out when it is not installed and not required; the firewall
+// is always shown, since having none is worth seeing even when nobody requires one.
+function secView(sec, pol, fresh, reboot) {
+    pol = pol || {};
+    var known = !!fresh && secValid(sec), out = [];
+    function svc(k, st, req, hideAbsent) {
+        if (!known || st === "unknown") return { k: k, tone: "unk" };
+        if (st === "active") return { k: k, tone: "ok" };
+        if (svcFault(st, req)) return { k: k, tone: "bad" };
+        return st === "absent" && hideAbsent ? null : { k: k, tone: "off" };
+    }
+    var luks = !known || (sec.luks !== true && sec.luks !== false) ? "unk"
+             : sec.luks ? "ok" : pol.luks ? "bad" : "off";
+    out.push({ k: "LUKS", tone: luks });
+    out.push(svc(known && sec.fw_name ? sec.fw_name.toUpperCase() : "FIREWALL", known ? sec.fw : "", pol.fw, false));
+    var u = svc("USBGUARD", known ? sec.usbguard : "", pol.usbguard, true);
+    if (u) out.push(u);
+    if (reboot) out.push({ k: "REBOOT", tone: "bad" });
+    return out;
+}
+
+// The GPU row. Busy % where the driver reports it (AMD, NVIDIA); otherwise the actual
+// clock against its maximum (Intel); "sleep" for a powered-down dGPU. Hidden on a
+// machine where no GPU driver was found at all.
+function gpuView(s) {
+    if (!s || s.ts === undefined) return { show: true, value: "—", frac: 0 };
+    if (has(s.gpu_busy)) return { show: true, value: s.gpu_busy + "%", frac: s.gpu_busy / 100 };
+    if (has(s.gpu_freq) && s.gpu_freq_max > 0)
+        return { show: true, value: Math.round(s.gpu_freq) + " MHz", frac: Math.min(1, s.gpu_freq / s.gpu_freq_max) };
+    if (s.gpu_state === "sleep") return { show: true, value: "sleep", frac: 0 };
+    var any = has(s.gpu_temp) || (s.src && s.src.gpu);
+    return { show: !!any, value: "—", frac: 0 };
+}
+
 // The card's single contextual row, fixed in height so the card never changes size:
-// FAN when hot, else SoC power (quiet unless on battery, charging or above 15 W), else empty.
+// FAN when hot, else the APU's package power (quiet unless on battery, charging or above
+// 15 W), else empty. A discrete card's board power is not shown: next to the GPU row it
+// reads as a second GPU, and it says nothing about the battery. On a machine with neither
+// a fan sensor nor package power the row can never show anything, so it is not reserved.
+function contextRowUsed(s) {
+    return !s || s.ts === undefined || has(s.fan) || socPower(s);
+}
+function socPower(s) { return has(s.soc_power) && s.power_kind !== "gpu"; }
 function contextRow(s, levels) {
     var none = { label: "", value: "", aux: "", tone: "none" };
     if (!s || s.ts === undefined) return none;
     levels = levels || {};
-    if ((levels.hotT || 0) > 0 || (levels.fan || 0) > 0)
-        return { label: "FAN", value: has(s.fan) ? s.fan + " rpm" : "—", aux: "", tone: "warn" };
-    if (has(s.soc_power)) {
+    if (has(s.fan) && ((levels.hotT || 0) > 0 || (levels.fan || 0) > 0))
+        return { label: "FAN", value: s.fan + " rpm", aux: "", tone: "warn" };
+    if (socPower(s)) {
         var active = (levels.socHi || 0) > 0 || s.bat_status === "Discharging" || s.bat_status === "Charging";
         return { label: "SOC", value: (s.soc_power / 1e6).toFixed(1) + " W",
                  aux: has(s.soc_cap) && s.soc_cap > 0 ? "/" + Math.round(s.soc_cap / 1e6) : "",

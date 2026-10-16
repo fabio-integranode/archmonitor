@@ -4,10 +4,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ID=io.arquimedes.archimonitor
 
-for dep in iw stat; do command -v "$dep" >/dev/null || { echo "falta: $dep"; exit 1; }; done
+for dep in stat findmnt; do command -v "$dep" >/dev/null || { echo "falta: $dep"; exit 1; }; done
 fc-list | grep -i 'Inter' >/dev/null || echo "aviso: instalá inter-font"
 fc-list | grep -i 'JetBrains Mono' >/dev/null || echo "aviso: instalá ttf-jetbrains-mono"
 command -v playerctl >/dev/null || echo "aviso: instalá playerctl para la barra de música (sudo pacman -S playerctl)"
+if compgen -G '/sys/class/net/*/phy80211' >/dev/null && ! command -v iw >/dev/null; then
+    echo "aviso: instalá iw para ver el nombre de la red Wi-Fi (sudo pacman -S iw)"
+fi
+if compgen -G '/sys/block/sd*' >/dev/null && ! grep -qx drivetemp /sys/class/hwmon/*/name 2>/dev/null; then
+    echo "aviso: para la temperatura de discos SATA: sudo modprobe drivetemp"
+    echo "       (permanente: echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf)"
+fi
 
 if kpackagetool6 -t Plasma/Applet -l | grep -qx "$ID"; then
     kpackagetool6 -t Plasma/Applet -u .

@@ -18,6 +18,7 @@ Item {
     property var alertList: []      // [{key, kind, sev, text, short}], worst first (L.present output)
     property bool stale: false      // fast telemetry older than L.FAST_STALE_MS: dim the figures
     property bool secFresh: true    // security snapshot younger than L.SEC_STALE_MS
+    property var policy: ({})       // security requirements { luks, fw, usbguard } from settings
     property bool expanded: false   // detail drawer open under the header
     property var procs: null        // top consumers for the drawer (null while sampling)
     property var termLog: ({})      // command name -> ms when SIGTERM was sent
@@ -66,16 +67,9 @@ Item {
     // Masks (rounded cover, fading marquee) need a GPU scene graph; with the software
     // renderer they would draw nothing, so fall back to the plain items.
     readonly property bool fx: GraphicsInfo.api !== GraphicsInfo.Software
-    readonly property bool secKnown: secFresh && !!sec && sec.ufw !== undefined
-    readonly property var secItems: {
-        var m = [
-            { k: "LUKS",     on: !!sec && sec.luks === true,         unk: !sec || typeof sec.luks !== "boolean" },
-            { k: "UFW",      on: !!sec && sec.ufw === "active",      unk: !sec || sec.ufw === "unknown" },
-            { k: "USBGUARD", on: !!sec && sec.usbguard === "active", unk: !sec || sec.usbguard === "unknown" }
-        ];
-        if (lv("reboot") > 0) m.push({ k: "REBOOT", on: false, unk: false });
-        return m;
-    }
+    readonly property var secItems: L.secView(sec, policy, secFresh, lv("reboot") > 0)
+    readonly property var gv: L.gpuView(s)
+    readonly property bool hasBattery: !live || L.has(s.bat_cap)
 
     implicitWidth: 272
     implicitHeight: col.implicitHeight + 2 * pad
@@ -357,7 +351,7 @@ Item {
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
                 Text {
-                    text: (card.live ? card.s.host : "archi").toUpperCase()
+                    text: card.live ? (card.s.host || "—").toUpperCase() : "…"
                     font.family: card.sans
                     font.pixelSize: 14
                     font.weight: Font.DemiBold
@@ -365,12 +359,23 @@ Item {
                     color: card.cFg
                     renderType: Text.NativeRendering
                 }
-                Note {
-                    text: (card.live && card.s.model ? card.s.model : "ThinkPad T14")
-                          + (card.live ? "  ·  up " + L.dur(card.s.uptime) : "")
-                    font.pixelSize: 9
-                    elide: Text.ElideRight
+                // Model, then uptime. A long model is cut, never the uptime.
+                RowLayout {
                     Layout.fillWidth: true
+                    spacing: 0
+                    Note {
+                        visible: card.live && !!card.s.model
+                        text: card.live && card.s.model ? card.s.model : ""
+                        font.pixelSize: 9
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                        Layout.maximumWidth: implicitWidth
+                    }
+                    Note {
+                        text: !card.live ? "" : (card.s.model ? "  ·  " : "") + "up " + L.dur(card.s.uptime)
+                        font.pixelSize: 9
+                    }
+                    Item { Layout.fillWidth: true }
                 }
             }
 
@@ -485,17 +490,18 @@ Item {
                 }
                 Metric {
                     label: "GPU"
-                    // Busy % is the meaningful figure; sclk reads ~0 under GFXOFF at idle.
-                    value: card.live && L.has(card.s.gpu_busy) ? card.s.gpu_busy + "%" : "—"
-                    aux: card.live ? L.degC(card.s.gpu_temp) : "—"
+                    // Busy % where the driver has it (AMD, NVIDIA), else the clock (Intel).
+                    visible: card.gv.show
+                    value: card.gv.value
+                    aux: L.degOpt(card.s.gpu_temp)
                     auxLevel: card.lv("gpuT")
-                    frac: card.live && L.has(card.s.gpu_busy) ? card.s.gpu_busy / 100 : 0
+                    frac: card.gv.frac
                 }
                 Metric {
                     label: "SSD"
                     value: card.diskCap > 0 ? L.gb(card.diskUsed) + " / " + L.gb(card.diskCap) + " GiB" : "—"
                     valueLevel: card.lv("disk")
-                    aux: card.live ? L.degC(card.s.ssd_temp) : "—"
+                    aux: L.degOpt(card.s.ssd_temp)
                     auxLevel: card.lv("ssdT")
                     frac: card.diskPct >= 0 ? card.diskPct / 100 : 0
                 }
@@ -504,6 +510,7 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 0
+                    visible: L.contextRowUsed(card.s)
                     Label {
                         text: card.ctx.label
                         color: card.ctx.tone === "quiet" ? card.cFaint : card.cSub
@@ -575,50 +582,58 @@ Item {
                 Num { text: " " + L.rate(card.tx); Layout.preferredWidth: 84; horizontalAlignment: Text.AlignRight }
             }
 
-            Gap { h: 20 }
-            Hair {}
-            Gap { h: 16 }
-
-            // Power
-            RowLayout {
+            // Power: only on machines with a battery.
+            ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 0
-                Label { text: "BATTERY"; Layout.fillWidth: true; Layout.alignment: Qt.AlignBaseline }
-                Num {
-                    text: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap + "%" : "—"
-                    font.pixelSize: 16
-                    font.weight: Font.Medium
-                    color: card.tone(card.lv("bat"), card.cFg)
+                visible: card.hasBattery
+
+                Gap { h: 20 }
+                Hair {}
+                Gap { h: 16 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Label { text: "BATTERY"; Layout.fillWidth: true; Layout.alignment: Qt.AlignBaseline }
+                    Num {
+                        text: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap + "%" : "—"
+                        font.pixelSize: 16
+                        font.weight: Font.Medium
+                        color: card.tone(card.lv("bat"), card.cFg)
+                    }
                 }
+                Gap { h: 8 }
+                Bar {
+                    frac: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap / 100 : 0
+                    level: card.lv("bat")
+                }
+                Gap { h: 8 }
+                Note { text: card.live ? L.batteryLine(card.s) : ""; Layout.fillWidth: true; elide: Text.ElideRight }
             }
-            Gap { h: 8 }
-            Bar {
-                frac: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap / 100 : 0
-                level: card.lv("bat")
-            }
-            Gap { h: 8 }
-            Note { text: card.live ? L.batteryLine(card.s) : ""; Layout.fillWidth: true; elide: Text.ElideRight }
 
             Gap { h: 20 }
             Hair {}
             Gap { h: 14 }
 
-            // Security posture
-            Row {
+            // Security posture (wraps when the names are long, e.g. FIREWALLD + REBOOT)
+            Flow {
                 Layout.fillWidth: true
                 spacing: 14
                 Repeater {
                     model: card.secItems
+                    // ok: filled green · bad: filled amber · off (not in use, not required):
+                    // hollow · unk (cannot tell): hollow with "?".
                     Row {
                         required property var modelData
-                        readonly property bool unknown: !card.secKnown || modelData.unk
-                        readonly property bool bad: !unknown && !modelData.on
+                        readonly property bool unknown: modelData.tone === "unk"
+                        readonly property bool bad: modelData.tone === "bad"
+                        readonly property bool hollow: unknown || modelData.tone === "off"
                         spacing: 5
                         Rectangle {
                             width: 5; height: 5; radius: 2.5
                             anchors.verticalCenter: parent.verticalCenter
-                            color: parent.unknown ? "transparent" : parent.bad ? card.cWarn : card.cOk
-                            border.width: parent.unknown ? 1 : 0
+                            color: parent.hollow ? "transparent" : parent.bad ? card.cWarn : card.cOk
+                            border.width: parent.hollow ? 1 : 0
                             border.color: card.cFaint
                         }
                         Label {

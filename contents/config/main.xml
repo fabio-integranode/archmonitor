@@ -10,5 +10,17 @@
             <min>0</min>
             <max>100</max>
         </entry>
+        <entry name="requireLuks" type="Bool">
+            <label>Alert when / is not on an encrypted (LUKS) device</label>
+            <default>false</default>
+        </entry>
+        <entry name="requireFirewall" type="Bool">
+            <label>Alert when no firewall (ufw, firewalld, nftables, iptables) is running</label>
+            <default>false</default>
+        </entry>
+        <entry name="requireUsbguard" type="Bool">
+            <label>Alert when USBGuard is not running</label>
+            <default>false</default>
+        </entry>
     </group>
 </kcfg>

@@ -27,6 +27,13 @@ PlasmoidItem {
 
     // Alert state is mutated by L.evaluate(); only its results are bound to the views.
     property var engine: L.freshState()
+    // What this machine must have (settings → Security). Off by default: a firewall,
+    // USBGuard or disk encryption are the owner's choices, not the widget's.
+    readonly property var policy: ({
+        luks: Plasmoid.configuration.requireLuks,
+        fw: Plasmoid.configuration.requireFirewall,
+        usbguard: Plasmoid.configuration.requireUsbguard
+    })
     property var levels: ({})
     property var alertList: []
 
@@ -128,7 +135,7 @@ PlasmoidItem {
         prev = d
         snap = d
         lastFast = now = Date.now()
-        const r = L.evaluate(engine, d, sec, lastSec ? now - lastSec : Infinity)
+        const r = L.evaluate(engine, d, sec, lastSec ? now - lastSec : Infinity, policy)
         levels = r.levels
         alertList = r.list
     }
@@ -175,6 +182,7 @@ PlasmoidItem {
         alertList: root.shownAlerts
         stale: root.stale
         secFresh: root.secAge <= L.SEC_STALE_MS
+        policy: root.policy
         bgOpacity: Plasmoid.configuration.opacity / 100
         expanded: root.detailOpen
         procs: root.procs

@@ -1,18 +1,20 @@
 // Alert engine tests. Run: node tests/test_logic.js
 const fs = require('fs'), path = require('path'), assert = require('assert');
 const src = fs.readFileSync(path.join(__dirname, '../contents/ui/Logic.js'), 'utf8').replace(/^\.pragma library.*$/m, '');
-const L = new Function(src + '; return { TH, UP, FAST_STALE_MS, SEC_STALE_MS, TERM_GRACE_MS, TERM_WINDOW_MS, derive, evaluate, present, contextRow, freshState, batteryLine, rate, dur, killSignal, killPending, killCommand, mediaView, mediaCommand, keepArt };')();
+const L = new Function(src + '; return { TH, UP, contextRowUsed, secView, gpuView, degOpt, FAST_STALE_MS, SEC_STALE_MS, TERM_GRACE_MS, TERM_WINDOW_MS, derive, evaluate, present, contextRow, freshState, batteryLine, rate, dur, killSignal, killPending, killCommand, mediaView, mediaCommand, keepArt };')();
 
 const base = () => ({
     ts: 1, host: 'archi', mem_total: 28e6, mem_avail: 15e6, fs_blocks: 100, fs_free: 50, fs_avail: 50, fs_bsize: 4096,
     cpu_temp: 45000, gpu_temp: 40000, ssd_temp: 44000, fan: 2000, iface: 'wlan0', ssid: 'x', signal: -40,
     bat_cap: 80, bat_status: 'Not charging'
 });
-const secOk = { luks: true, ufw: 'active', usbguard: 'active', reboot: false };
+const secOk = { luks: true, fw: 'active', fw_name: 'ufw', usbguard: 'active', reboot: false };
+// The author's settings: everything required. Defaults (nothing required) are tested apart.
+const STRICT = { luks: true, fw: true, usbguard: true };
 
 // Feed a series of overrides, one per sample; returns the result of each.
-function run(series, sec = secOk, st = L.freshState()) {
-    return series.map(o => L.evaluate(st, Object.assign(base(), o), sec));
+function run(series, sec = secOk, st = L.freshState(), pol = STRICT) {
+    return series.map(o => L.evaluate(st, Object.assign(base(), o), sec, undefined, pol));
 }
 const lvl = (r, k) => r.levels[k] || 0;
 const texts = r => r.list.map(a => a.text);
@@ -83,12 +85,12 @@ t('offline needs persistence, recovers immediately', () => {
     assert.strictEqual(r[3].list.length, 0);
 });
 t('security flags: LUKS off, UFW down, USBGuard down, reboot pending', () => {
-    const bad = { luks: false, ufw: 'inactive', usbguard: 'failed', reboot: true };
+    const bad = { luks: false, fw: 'down', fw_name: 'ufw', usbguard: 'down', reboot: true };
     const r = run(Array(L.UP).fill({}), bad).at(-1);
     assert.deepStrictEqual(texts(r).sort(), ['LUKS OFF', 'REBOOT PENDING', 'UFW DOWN', 'USBGUARD DOWN']);
 });
 t('pill label is shortened for long flags, full text kept for the panel', () => {
-    const r = run(Array(L.UP).fill({}), { ...secOk, reboot: true, usbguard: 'failed' }).at(-1);
+    const r = run(Array(L.UP).fill({}), { ...secOk, reboot: true, usbguard: 'down' }).at(-1);
     const by = Object.fromEntries(r.list.map(a => [a.key, a]));
     assert.strictEqual(by.reboot.short, 'REBOOT');
     assert.strictEqual(by.reboot.text, 'REBOOT PENDING');
@@ -102,15 +104,15 @@ t('security probe never reported: SECURITY ? (unknown) after persistence, not be
     }
 });
 t('security snapshot older than 90 s: SECURITY ?, and its stale findings are not reported', () => {
-    const st = L.freshState(), sec = { luks: false, ufw: 'inactive', usbguard: 'active', reboot: false };
-    let r; for (let i = 0; i < L.UP; i++) r = L.evaluate(st, base(), sec, L.SEC_STALE_MS + 1);
+    const st = L.freshState(), sec = { luks: false, fw: 'down', fw_name: 'ufw', usbguard: 'active', reboot: false };
+    let r; for (let i = 0; i < L.UP; i++) r = L.evaluate(st, base(), sec, L.SEC_STALE_MS + 1, STRICT);
     assert.deepStrictEqual(texts(r), ['SECURITY ?']);
-    for (let i = 0; i < L.UP; i++) r = L.evaluate(st, base(), sec, 1000);
+    for (let i = 0; i < L.UP; i++) r = L.evaluate(st, base(), sec, 1000, STRICT);
     assert.deepStrictEqual(texts(r).sort(), ['LUKS OFF', 'UFW DOWN']);
 });
-t('systemctl "unknown" is UFW ?, not UFW DOWN', () => {
-    const r = run(Array(L.UP).fill({}), { ...secOk, ufw: 'unknown', usbguard: 'unknown' }).at(-1);
-    assert.deepStrictEqual(r.list.map(a => [a.text, a.kind]), [['UFW ?', 'unknown'], ['USBGUARD ?', 'unknown']]);
+t('systemctl "unknown" is FIREWALL ?, not a fault', () => {
+    const r = run(Array(L.UP).fill({}), { ...secOk, fw: 'unknown', fw_name: '', usbguard: 'unknown' }).at(-1);
+    assert.deepStrictEqual(r.list.map(a => [a.text, a.kind]), [['FIREWALL ?', 'unknown'], ['USBGUARD ?', 'unknown']]);
 });
 t('LUKS undeterminable (null) is LUKS ?, not LUKS OFF', () => {
     const r = run(Array(L.UP).fill({}), { ...secOk, luks: null }).at(-1);
@@ -133,9 +135,13 @@ t('missing secondary sensors (GPU/SSD temp, fan, signal) never alert', () => {
     const o = { gpu_temp: null, ssd_temp: null, fan: null, signal: null };
     assert(run(Array(5).fill(o)).every(x => x.list.length === 0));
 });
-t('missing CPU temperature blocks NOMINAL as unknown, ranked below warnings', () => {
-    const r = run(Array(L.UP).fill({ cpu_temp: null, mem_avail: 3e6 })).at(-1);
+t('a CPU sensor that stops answering blocks NOMINAL as unknown, ranked below warnings', () => {
+    const r = run([{}, ...Array(L.UP).fill({ cpu_temp: null, mem_avail: 3e6 })]).at(-1);
     assert.deepStrictEqual(r.list.map(a => [a.text, a.kind]), [['MEM 89%', 'warn'], ['CPU TEMP ?', 'unknown']]);
+});
+t('a machine that never had a CPU sensor (VM, unknown board) is not flagged', () => {
+    const r = run(Array(10).fill({ cpu_temp: null })).at(-1);
+    assert.strictEqual(r.list.length, 0);
 });
 t('entries carry their kind: crit and warn from rules', () => {
     const r = run(Array(L.UP).fill({ cpu_temp: 95000, ssd_temp: 66000 })).at(-1);
@@ -231,4 +237,63 @@ t('keepArt: same track keeps its cover; a new track or a real cover does not', (
     assert.strictEqual(L.keepArt(null, { player: 'p', title: 't', art: '' }).art, '');
     assert.deepStrictEqual(L.keepArt(prev, { available: true, player: null }), { available: true, player: null });
 });
+
+// ── Portability: other people's machines ─────────────────────────────────────
+const DEF = {};   // default policy: nothing required
+const runP = (sec, pol) => run(Array(L.UP).fill({}), sec, L.freshState(), pol).at(-1);
+t('default policy: no firewall, no USBGuard, no LUKS is still NOMINAL', () => {
+    const r = runP({ luks: false, fw: 'off', fw_name: '', usbguard: 'absent', reboot: false }, DEF);
+    assert.deepStrictEqual(texts(r), []);
+    assert.deepStrictEqual(texts(runP({ luks: null, fw: 'absent', fw_name: '', usbguard: 'absent', reboot: false }, DEF)), []);
+    assert.deepStrictEqual(texts(runP({ ...secOk, fw: 'unknown', usbguard: 'unknown' }, DEF)), []);
+});
+t('default policy: a service that should run and does not still alerts', () => {
+    assert.deepStrictEqual(texts(runP({ ...secOk, fw: 'down', fw_name: 'firewalld' }, DEF)), ['FIREWALLD DOWN']);
+    const r = runP({ ...secOk, usbguard: 'down' }, DEF);
+    assert.deepStrictEqual(r.list.map(a => [a.text, a.short]), [['USBGUARD DOWN', 'USBGUARD']]);
+});
+t('required: missing firewall / USBGuard / encryption alert, with short pill labels', () => {
+    const r = runP({ luks: false, fw: 'absent', fw_name: '', usbguard: 'off', reboot: false }, STRICT);
+    assert.deepStrictEqual(r.list.map(a => [a.text, a.short]),
+        [['LUKS OFF', 'LUKS OFF'], ['NO FIREWALL', 'NO FW'], ['USBGUARD DOWN', 'USBGUARD']]);
+    assert.strictEqual(runP({ ...secOk, fw: 'down', fw_name: 'ufw' }, STRICT).list[0].short, 'UFW DOWN');
+    assert.strictEqual(runP({ ...secOk, fw: 'down', fw_name: 'firewalld' }, STRICT).list[0].short, 'FW DOWN');
+});
+t('an old-format security snapshot reads as SECURITY ?, not as all clear', () => {
+    const r = runP({ luks: true, ufw: 'active', usbguard: 'active', reboot: false }, DEF);
+    assert.deepStrictEqual(texts(r), ['SECURITY ?']);
+});
+t('secView: dots per check and policy', () => {
+    const v = (sec, pol, fresh = true, rb = false) => L.secView(sec, pol, fresh, rb).map(i => i.k + ':' + i.tone).join(' ');
+    assert.strictEqual(v(secOk, STRICT), 'LUKS:ok UFW:ok USBGUARD:ok');
+    assert.strictEqual(v({ luks: false, fw: 'off', fw_name: '', usbguard: 'absent' }, DEF), 'LUKS:off FIREWALL:off');
+    assert.strictEqual(v({ luks: false, fw: 'off', fw_name: '', usbguard: 'absent' }, STRICT), 'LUKS:bad FIREWALL:bad USBGUARD:bad');
+    assert.strictEqual(v({ luks: true, fw: 'down', fw_name: 'firewalld', usbguard: 'off' }, DEF), 'LUKS:ok FIREWALLD:bad USBGUARD:off');
+    assert.strictEqual(v({ luks: null, fw: 'unknown', fw_name: '', usbguard: 'unknown' }, DEF), 'LUKS:unk FIREWALL:unk USBGUARD:unk');
+    assert.strictEqual(v(secOk, STRICT, false), 'LUKS:unk FIREWALL:unk USBGUARD:unk', 'stale: nothing claimed');
+    assert.strictEqual(v(secOk, DEF, true, true), 'LUKS:ok UFW:ok USBGUARD:ok REBOOT:bad');
+});
+t('gpuView: busy %, Intel clock, sleeping dGPU, no GPU at all', () => {
+    const g = o => L.gpuView(Object.assign(base(), o));
+    assert.deepStrictEqual(g({ gpu_busy: 9 }), { show: true, value: '9%', frac: 0.09 });
+    assert.deepStrictEqual(g({ gpu_busy: null, gpu_freq: 450, gpu_freq_max: 1300 }), { show: true, value: '450 MHz', frac: 450 / 1300 });
+    assert.deepStrictEqual(g({ gpu_busy: null, gpu_state: 'sleep', src: { gpu: 'nvidia' } }), { show: true, value: 'sleep', frac: 0 });
+    assert.strictEqual(g({ gpu_busy: null, gpu_temp: null, src: { gpu: '' } }).show, false);
+    assert.strictEqual(g({ gpu_busy: null, gpu_temp: 40000 }).show, true);
+    assert.strictEqual(L.gpuView({}).show, true, 'before the first sample the row is kept');
+});
+t('contextRow: APU package power shown, a discrete card\'s board power not; no FAN without a fan sensor', () => {
+    assert.strictEqual(L.contextRow(Object.assign(base(), { soc_power: 30e6, power_kind: 'gpu' }), {}).tone, 'none');
+    assert.strictEqual(L.contextRow(Object.assign(base(), { soc_power: 9e6, power_kind: 'soc' }), {}).label, 'SOC');
+    assert.strictEqual(L.contextRow(Object.assign(base(), { fan: null, soc_power: null }), { hotT: 1 }).tone, 'none');
+    assert.strictEqual(L.contextRowUsed(Object.assign(base(), { fan: null, soc_power: null })), false);
+    assert.strictEqual(L.contextRowUsed(Object.assign(base(), { fan: null, soc_power: 30e6, power_kind: 'gpu' })), false);
+    assert.strictEqual(L.contextRowUsed(base()), true);
+    assert.strictEqual(L.contextRowUsed({}), true);
+});
+t('degOpt: blank for a sensor the machine does not have', () => {
+    assert.strictEqual(L.degOpt(null), '');
+    assert.strictEqual(L.degOpt(41000), '41°C');
+});
+
 console.log(`${n} passed`);
