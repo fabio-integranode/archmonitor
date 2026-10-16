@@ -21,6 +21,23 @@ Monitor de recursos nativo para **KDE Plasma 6** (Wayland): una tarjeta sobria e
 
 Requiere Arch Linux (o derivada) con KDE Plasma 6.
 
+### Desde el archivo `.plasmoid`
+
+Bajá `archmonitor-X.Y.Z.plasmoid` de [Releases](https://github.com/fabio-integranode/archmonitor/releases/latest) y:
+
+```bash
+sudo pacman -S --needed inter-font ttf-jetbrains-mono iw playerctl
+kpackagetool6 -t Plasma/Applet -i archmonitor-*.plasmoid      # primera vez
+kpackagetool6 -t Plasma/Applet -u archmonitor-*.plasmoid      # para actualizar
+systemctl --user restart plasma-plasmashell
+```
+
+O sin terminal: clic derecho en el escritorio → *Añadir elementos gráficos* → *Obtener elementos gráficos nuevos* → *Instalar elemento gráfico desde archivo local…*.
+
+`plasmapkg` / `plasmapkg2` eran de Plasma 4 y 5; en Plasma 6 la herramienta es `kpackagetool6`. Si tras actualizar algo se ve como antes, borrá la caché de QML: `rm -rf ~/.cache/plasmashell/qmlcache` y reiniciá plasmashell.
+
+### Desde el código
+
 ```bash
 sudo pacman -S --needed inter-font ttf-jetbrains-mono iw playerctl
 git clone https://github.com/fabio-integranode/archmonitor.git
@@ -31,6 +48,8 @@ cd archmonitor
 Después: clic derecho en el escritorio → *Añadir elementos gráficos* → **Archmonitor**. Arrastralo a una esquina.
 
 Para actualizar: `git pull && ./install.sh && systemctl --user restart plasma-plasmashell`.
+
+`install.sh` además avisa qué dependencias opcionales faltan, borra la caché de QML y retira un Conky previo. `./package.sh` arma el `.plasmoid` en `dist/` (sólo `metadata.json`, `contents/` y la licencia).
 
 `iw` (nombre de la red Wi-Fi) y `playerctl` (barra de música) son opcionales: sin `iw` la tarjeta muestra la interfaz y la señal; sin `playerctl` no hay barra. `lm_sensors` no hace falta. `findmnt` (util-linux) y `getconf` (glibc) ya vienen con Arch.
 
