@@ -4,7 +4,7 @@ Monitor de recursos nativo para **KDE Plasma 6** (Wayland): una tarjeta sobria e
 
 <p align="center">
   <a href="docs/archmonitor-reel.mp4"><img src="docs/archmonitor-reel-preview.gif" alt="Sobrecarga, diagnóstico y vuelta a NOMINAL (clic para ver el video completo)" width="240"></a>
-  <img src="docs/escritorio.png" alt="Archmonitor en el escritorio, con música del navegador" width="240">
+  <img src="docs/tarjeta.png" alt="Archmonitor: la tarjeta en estado nominal" width="240">
   <img src="docs/sobrecarga.png" alt="Sobrecarga: el cajón muestra el proceso culpable, listo para detenerlo" width="240">
 </p>
 
