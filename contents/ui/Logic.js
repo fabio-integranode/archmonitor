@@ -77,7 +77,9 @@ function batteryLine(s) {
             }
         }
     } else if (st === "Not charging") {
-        out.push(has(s.bat_limit) && s.bat_cap >= s.bat_limit - 3 ? "AC · held at " + s.bat_limit + "%" : "AC · idle");
+        if (has(s.bat_limit) && s.bat_cap >= s.bat_limit - 3) out.push("AC · held at " + s.bat_limit + "%");
+        else if (has(s.bat_start) && s.bat_start > 0 && s.bat_cap > s.bat_start) out.push("AC · charges below " + s.bat_start + "%");
+        else out.push("AC · idle");
     } else if (st === "Full") {
         out.push("AC · full");
     } else if (st) {
@@ -394,4 +396,57 @@ function keepArt(prev, next) {
     for (var k in next) m[k] = next[k];
     m.art = prev.art;
     return m;
+}
+
+// ── Battery charge window ────────────────────────────────────────────────────
+// Charging starts below `start` and stops at `end` (charge_control_*_threshold). The
+// widget edits the saved window through a root helper; "full" charges to 100 % until the
+// saved window is applied again (button, or next boot). Limits match the helper's.
+var WIN = { startMax: 95, endMin: 50, gap: 5, step: 5 };
+
+function batteryView(s) {
+    if (!s || s.ts === undefined || !has(s.bat_limit)) return { show: false, ctl: false, hasStart: false, full: false, start: 0, end: 100 };
+    var hasStart = has(s.bat_start);
+    var careEnd = has(s.care_end) ? s.care_end : s.bat_limit;
+    var careStart = has(s.care_start) ? s.care_start : hasStart ? s.bat_start : 0;
+    return {
+        show: true,
+        ctl: s.bat_ctl === true,
+        hasStart: hasStart,
+        full: s.bat_limit === 100 && has(s.care_end) && s.care_end < 100,
+        start: careStart,
+        end: careEnd
+    };
+}
+
+// The window after moving one handle: snapped to 5 %, inside the limits, and never
+// narrower than 5 %: the moved handle stops at the other one instead of pushing it.
+function clampWindow(start, end, moved) {
+    var g = WIN.gap;
+    start = Math.round(start / WIN.step) * WIN.step;
+    end = Math.round(end / WIN.step) * WIN.step;
+    start = Math.max(0, Math.min(WIN.startMax, start));
+    end = Math.max(WIN.endMin, Math.min(100, end));
+    if (end - start < g) {
+        if (moved === "start") start = end - g;
+        else end = Math.min(100, start + g);
+        if (end - start < g) start = end - g;
+    }
+    return { start: start, end: end };
+}
+
+function isInt(v) { return typeof v === "number" && Math.floor(v) === v; }
+
+// Probe command for a battery action, or "" when anything is off.
+function batteryCommand(probe, action, start, end) {
+    if (action === "full" || action === "care") return probe + " bat-" + action;
+    if (action !== "set" || !isInt(start) || !isInt(end)) return "";
+    if (start < 0 || start > WIN.startMax || end < WIN.endMin || end > 100 || end - start < WIN.gap) return "";
+    return probe + " bat-set " + start + " " + end;
+}
+
+// One line for a failed battery action (exit codes of the probe's bat-* modes).
+function batteryError(code) {
+    return code === 126 ? "not authorised" : code === 127 ? "helper not installed"
+         : code === 3 ? "no thresholds" : code === 4 ? "write failed" : "rejected";
 }

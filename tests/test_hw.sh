@@ -182,5 +182,44 @@ check "masked counts as off" "$(sec 'ufw.service masked inactive masked')" .fw=o
 : > "$units"
 check "systemctl cannot answer: unknown" "$(ARCHI_SYSTEMCTL=$sctl ARCHI_ROOT_DEV=none bash "$probe" sec)" .fw=unknown .usbguard=unknown
 
+echo "Battery charge window: root helper (test mode, not root)"
+helper=$here/../extras/battery/archmonitor-battery
+S=$tmp/batw; B=$S/class/power_supply/BAT0; conf=$tmp/batw.conf
+w $B/type Battery; w $B/capacity 79; w $B/charge_control_start_threshold 40; w $B/charge_control_end_threshold 80
+w $S/class/power_supply/mouse/type Battery; w $S/class/power_supply/mouse/scope Device
+w $S/class/power_supply/mouse/charge_control_end_threshold 100
+hl() { ARCHI_SYS=$S ARCHI_BATCONF=$conf bash "$helper" "$@" 2>/dev/null; }
+thr() { printf '%s-%s' "$(< $B/charge_control_start_threshold)" "$(< $B/charge_control_end_threshold)"; }
+hl set 40 80; [[ $? == 0 && $(thr) == 40-80 && $(< $conf) == $'start=40\nend=80' ]] && ok "set saves and applies" || bad "set saves and applies ($(thr))"
+hl full; [[ $(thr) == 99-100 && $(< $conf) == $'start=40\nend=80' ]] && ok "full: 99–100 now, saved window untouched" || bad "full ($(thr))"
+[[ $(< $S/class/power_supply/mouse/charge_control_end_threshold) == 100 ]] && ok "peripherals untouched" || bad "peripherals untouched"
+hl care; [[ $(thr) == 40-80 ]] && ok "care restores the saved window (start written after end when lowering)" || bad "care ($(thr))"
+hl set 85 95; [[ $(thr) == 85-95 ]] && ok "raising past the current end: end written first" || bad "raising past current end ($(thr))"
+hl set 40 80
+for args in "set 40 45" "set 40 42" "set 96 100" "set 40 101" "set 4x 80" "set 40" "full extra" "rm -rf /"; do
+    hl $args; rc=$?
+    [[ $rc == 2 && $(thr) == 40-80 ]] && ok "refused: $args" || bad "refused: $args (rc $rc, $(thr))"
+done
+S2=$tmp/batnone; w $S2/class/power_supply/BAT0/type Battery
+ARCHI_SYS=$S2 ARCHI_BATCONF=$conf bash "$helper" set 40 80 2>/dev/null; [[ $? == 3 ]] && ok "no thresholds: exit 3" || bad "no thresholds: exit 3"
+rm -f $tmp/none.conf; ARCHI_SYS=$S ARCHI_BATCONF=$tmp/none.conf bash "$helper" care; [[ $? == 0 && $(thr) == 40-80 ]] && ok "care without a saved window: no-op" || bad "care without a saved window"
+
+echo "Battery charge window: probe"
+fh=$tmp/fakehelper; log=$tmp/pk.log
+printf '#!/bin/sh\nexit 0\n' > "$fh"; chmod +x "$fh"
+pk=$tmp/pkexec; printf '#!/bin/sh\necho "$@" >> %s\nexit ${PK_RC:-0}\n' "$log" > "$pk"; chmod +x "$pk"
+bp() { env ARCHI_BATHELPER=$fh ARCHI_PKEXEC=$pk ARCHI_BATCONF=$conf ARCHI_SYS=$S ARCHI_ROUTE=$rt "$@"; }
+check "fast probe: thresholds, helper present, saved window" "$(bp bash "$probe")" .bat_start=40 .bat_limit=80 .bat_ctl=true .care_start=40 .care_end=80
+check "fast probe: no helper, read-only" "$(bp ARCHI_BATHELPER=$tmp/nope bash "$probe")" .bat_ctl=false .care_end=null
+: > "$log"
+check "bat-set goes through pkexec" "$(bp bash "$probe" bat-set 40 80)" .ok=true .code=0
+[[ $(< $log) == "$fh set 40 80" ]] && ok "pkexec called with the helper path and validated numbers" || bad "pkexec args: $(< $log)"
+check "bat-full" "$(bp bash "$probe" bat-full)" .action=full .ok=true
+check "dismissed authorisation: 126" "$(bp PK_RC=126 bash "$probe" bat-care)" .ok=false .code=126
+: > "$log"
+check "malformed request never reaches pkexec" "$(bp bash "$probe" bat-set 40 '80;id')" .ok=false .code=2
+[[ ! -s $log ]] && ok "nothing executed for a malformed request" || bad "pkexec ran for a malformed request"
+check "helper missing: 127" "$(bp ARCHI_BATHELPER=$tmp/nope bash "$probe" bat-full)" .ok=false .code=127
+
 (( fail )) || echo "all passed"
 exit $fail

@@ -1,0 +1,105 @@
+#!/bin/bash
+# archmonitor-battery — battery charge window for Archmonitor. Runs as root, through
+# pkexec from the widget (polkit action io.arquimedes.archmonitor.battery) and through
+# archmonitor-battery.service at boot.
+#
+#   archmonitor-battery set START END   save the window and apply it
+#   archmonitor-battery full            charge to 100 % now; the saved window comes back
+#                                       with `care` or at the next boot
+#   archmonitor-battery care            apply the saved window
+#
+# Applies to every system battery with a charge_control_end_threshold (dual-battery
+# ThinkPads have two). Window limits: START 0–95, END 50–100, END − START ≥ 5; an end
+# below 50 % is refused so a slip of the hand cannot leave a laptop unable to charge for
+# a trip. The saved window lives in /etc/archmonitor/battery.conf (start=N, end=N).
+#
+# Exit codes: 0 done, 2 bad request, 3 no battery with thresholds, 4 a write failed.
+set -euo pipefail
+export PATH=/usr/bin:/bin
+umask 022
+
+INSTALLED=/usr/local/lib/archmonitor/archmonitor-battery
+if [[ -n ${ARCHI_SYS:-} && $(readlink -f -- "$0") != "$INSTALLED" ]]; then
+    # Tests: a fake /sys and conf, honoured only for a copy outside the installed path.
+    # The installed helper always uses the real ones (and pkexec clears the environment).
+    SYS=$ARCHI_SYS CONF=${ARCHI_BATCONF:?ARCHI_BATCONF is required with ARCHI_SYS}
+elif (( EUID == 0 )); then
+    SYS=/sys CONF=/etc/archmonitor/battery.conf
+else
+    echo "archmonitor-battery: must run as root" >&2; exit 2
+fi
+
+die() { echo "archmonitor-battery: $2" >&2; exit "$1"; }
+num() { [[ $1 =~ ^[0-9]{1,3}$ ]] && (( 10#$1 <= 100 )); }
+
+# System batteries that expose an end threshold (peripherals carry scope=Device).
+batteries() {
+    local b t s
+    for b in "$SYS"/class/power_supply/*; do
+        t="" s=""
+        { read -r t < "$b/type"; } 2>/dev/null || continue
+        [[ $t == Battery ]] || continue
+        { read -r s < "$b/scope"; } 2>/dev/null || true
+        [[ $s == Device ]] && continue
+        [[ -e $b/charge_control_end_threshold ]] && printf '%s\n' "$b"
+    done
+    return 0
+}
+
+put() { printf '%d\n' "$2" > "$1" 2>/dev/null || die 4 "could not write $2 to $1"; }
+
+# apply START END — the kernel rejects a start at or above the current end (and an end at
+# or below the current start), so the order of the two writes depends on the direction.
+apply() {
+    local start=$1 end=$2 b cur n=0
+    while IFS= read -r b; do
+        n=$((n + 1))
+        if [[ -e $b/charge_control_start_threshold ]]; then
+            cur=100; { read -r cur < "$b/charge_control_end_threshold"; } 2>/dev/null || true
+            [[ $cur =~ ^[0-9]+$ ]] || cur=100
+            if (( start >= cur )); then
+                put "$b/charge_control_end_threshold" "$end"
+                put "$b/charge_control_start_threshold" "$start"
+            else
+                put "$b/charge_control_start_threshold" "$start"
+                put "$b/charge_control_end_threshold" "$end"
+            fi
+        else
+            put "$b/charge_control_end_threshold" "$end"
+        fi
+    done < <(batteries)
+    (( n > 0 )) || die 3 "no battery with charge thresholds"
+}
+
+case ${1:-} in
+    set)
+        (( $# == 3 )) || die 2 "usage: set START END"
+        num "$2" && num "$3" || die 2 "thresholds must be 0–100"
+        start=$((10#$2)) end=$((10#$3))
+        (( start <= 95 && end >= 50 && end - start >= 5 )) \
+            || die 2 "window must satisfy START ≤ 95, END ≥ 50, END − START ≥ 5"
+        apply "$start" "$end"
+        mkdir -p "${CONF%/*}"
+        tmp=$(mktemp "$CONF.XXXXXX")
+        printf 'start=%d\nend=%d\n' "$start" "$end" > "$tmp"
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$CONF"
+        ;;
+    full)
+        (( $# == 1 )) || die 2 "usage: full"
+        apply 99 100            # start 99: charging resumes right away below 99 %
+        ;;
+    care)
+        (( $# == 1 )) || die 2 "usage: care"
+        [[ -r $CONF ]] || exit 0
+        start="" end=""
+        while IFS='=' read -r k v; do
+            case $k in start) start=$v ;; end) end=$v ;; esac
+        done < "$CONF"
+        num "$start" && num "$end" || die 2 "$CONF is malformed"
+        apply "$((10#$start))" "$((10#$end))"
+        ;;
+    *)
+        die 2 "usage: archmonitor-battery set START END | full | care"
+        ;;
+esac

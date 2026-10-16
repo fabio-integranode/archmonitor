@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Archmonitor</vendor>
+  <vendor_url>https://github.com/fabio-integranode/archmonitor</vendor_url>
+
+  <!-- The user at the machine (the active local session) may change the charge window
+       without a password: it is a battery-care setting, the helper validates every
+       value, and the worst it can do is keep the battery from charging past 50 %.
+       Anyone else needs an administrator. For a password every time, set allow_active
+       to auth_admin_keep. -->
+  <action id="io.arquimedes.archmonitor.battery">
+    <description>Set the battery charge window</description>
+    <description xml:lang="es">Ajustar la ventana de carga de la batería</description>
+    <message>Archmonitor wants to change the battery charge thresholds</message>
+    <message xml:lang="es">Archmonitor quiere cambiar los umbrales de carga de la batería</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/archmonitor/archmonitor-battery</annotate>
+  </action>
+</policyconfig>

@@ -106,6 +106,26 @@ PlasmoidItem {
         }
     }
 
+    // Battery charge window: commands go to the probe's bat-* modes (root helper via
+    // pkexec); the result is kept so the card can say "not authorised" and roll back.
+    property var batResult: null
+    function batteryAction(action, start, end) {
+        const cmd = L.batteryCommand(root.probe, action, start, end)
+        if (cmd) batExec.connectSource(cmd)
+    }
+    P5Support.DataSource {
+        id: batExec
+        engine: "executable"
+        onNewData: (source, data) => {
+            try {
+                const r = JSON.parse(data["stdout"])
+                r.at = Date.now()
+                root.batResult = r
+            } catch (e) {}
+            disconnectSource(source)
+        }
+    }
+
     // Fire-and-forget commands (stop a process, media buttons).
     P5Support.DataSource {
         id: oneshot
@@ -193,5 +213,7 @@ PlasmoidItem {
         media: root.media
         mediaAt: root.mediaAt
         onMediaAction: (action) => root.mediaAction(action)
+        batResult: root.batResult
+        onBatteryAction: (action, start, end) => root.batteryAction(action, start, end)
     }
 }

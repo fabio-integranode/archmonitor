@@ -7,6 +7,8 @@
 #   archi-stat.sh kill SIG NAME PID...   SIGTERM/SIGKILL to the listed PIDs, re-validated
 #   archi-stat.sh media                  what a browser is playing (MPRIS, via playerctl)
 #   archi-stat.sh media-ctl ACTION PLAYER   play-pause | next | previous | raise
+#   archi-stat.sh bat-set START END | bat-full | bat-care   charge window, via the root
+#                        helper (install-battery-helper.sh) and pkexec
 #
 # Reads /proc and /sys directly. External tools per fast tick: stat(1), iw(8) on Wi-Fi
 # when installed, nvidia-smi only while an NVIDIA card is awake. No lm_sensors, no awk,
@@ -300,6 +302,31 @@ if [[ ${1:-} == media-ctl ]]; then
         esac
     fi
     printf '{"action":%s,"ok":%s}\n' "$(js "$action")" "$ok"
+    exit 0
+fi
+
+# ── Battery charge window ────────────────────────────────────────────────────
+# Thresholds live in root-only sysfs files. The widget never writes them itself: it asks
+# the root helper through pkexec, and the helper validates again. Exit codes reported:
+# 0 done, 2 bad request, 3 no battery, 4 write failed, 126 not authorised or dismissed,
+# 127 helper or pkexec missing.
+BATHELPER=${ARCHI_BATHELPER:-/usr/local/lib/archmonitor/archmonitor-battery}
+BATCONF=${ARCHI_BATCONF:-/etc/archmonitor/battery.conf}
+PKEXEC=${ARCHI_PKEXEC:-pkexec}
+if [[ ${1:-} == bat-set || ${1:-} == bat-full || ${1:-} == bat-care ]]; then
+    act=${1#bat-} rc=2
+    case $act in
+        set)  [[ ${2:-} =~ ^[0-9]{1,3}$ && ${3:-} =~ ^[0-9]{1,3}$ && $# == 3 ]] && args=(set "$2" "$3") || args=() ;;
+        *)    (( $# == 1 )) && args=("$act") || args=() ;;
+    esac
+    if (( ${#args[@]} )); then
+        if [[ -x $BATHELPER ]] && command -v "$PKEXEC" >/dev/null 2>&1; then
+            "$PKEXEC" "$BATHELPER" "${args[@]}" >/dev/null 2>&1; rc=$?
+        else
+            rc=127
+        fi
+    fi
+    printf '{"action":%s,"ok":%s,"code":%d}\n' "$(js "$act")" "$([[ $rc == 0 ]] && echo true || echo false)" "$rc"
     exit 0
 fi
 
@@ -603,6 +630,7 @@ fi
 # but carry scope=Device. Drivers report either energy (µWh) or charge (µAh); charge is
 # converted with the design voltage, and power is unsigned whatever the driver's sign.
 bat_cap=null bat_status="" bat_power=null bat_energy=null bat_full=null bat_limit=null bat_src=""
+bat_start=null bat_ctl=false care_start=null care_end=null
 for b in "$SYS"/class/power_supply/*; do
     ty="" sc=""
     rs ty "$b/type" && [[ $ty == Battery ]] || continue
@@ -622,8 +650,22 @@ for b in "$SYS"/class/power_supply/*; do
         fi
     fi
     rd bat_limit "$b/charge_control_end_threshold"
+    rd bat_start "$b/charge_control_start_threshold"
     break
 done
+# The window can be changed from the widget once the root helper is installed; the saved
+# window (what `care` restores) tells a temporary full charge apart from a chosen 100 %.
+if [[ $bat_limit != null && -x $BATHELPER ]]; then
+    bat_ctl=true
+    if [[ -r $BATCONF ]]; then
+        while IFS='=' read -r k v; do
+            case $k in
+                start) [[ $v =~ ^[0-9]{1,3}$ ]] && care_start=$((10#$v)) ;;
+                end)   [[ $v =~ ^[0-9]{1,3}$ ]] && care_end=$((10#$v)) ;;
+            esac
+        done < "$BATCONF"
+    fi
+fi
 
 printf '{"ts":%s,"host":%s,"model":%s,"uptime":%s,' "$ts" "$(js "$host")" "$(js "$model")" "$uptime"
 printf '"cpu_total":%s,"cpu_idle":%s,"cpu_temp":%s,' "$cpu_total" "$cpu_idle" "$cpu_t"
@@ -636,5 +678,6 @@ printf '"fs_blocks":%s,"fs_free":%s,"fs_avail":%s,"fs_bsize":%s,' "${fs_blocks:-
 printf '"iface":%s,"rx":%s,"tx":%s,"ssid":%s,"signal":%s,' "$(js "$iface")" "$rx" "$tx" "$(js "$ssid")" "$sig"
 printf '"bat_cap":%s,"bat_status":%s,"bat_power":%s,"bat_energy":%s,"bat_full":%s,"bat_limit":%s,' \
     "$bat_cap" "$(js "$bat_status")" "$bat_power" "$bat_energy" "$bat_full" "$bat_limit"
+printf '"bat_start":%s,"bat_ctl":%s,"care_start":%s,"care_end":%s,' "$bat_start" "$bat_ctl" "$care_start" "$care_end"
 printf '"src":{"cpu":%s,"gpu":%s,"ssd":%s,"fan":%s,"bat":%s}}\n' \
     "$(js "$cpu_src")" "$(js "$gpu_src")" "$(js "$ssd_src")" "$(js "$fan_src")" "$(js "$bat_src")"

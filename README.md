@@ -12,6 +12,7 @@ Monitor de recursos nativo para **KDE Plasma 6** (Wayland): una tarjeta sobria e
 
 - **Sistema:** CPU, RAM, GPU y disco, con temperaturas, potencia del SoC y ventilador cuando hace falta.
 - **Red y batería:** enlace físico, señal Wi-Fi y tasas; carga, potencia y tiempo restante.
+- **Ventana de carga:** un clic en BATTERY y se arrastran el inicio y el fin de carga sobre la barra; `CHARGE TO 100%` carga completa por hoy (un viaje) y vuelve sola a la ventana al reiniciar.
 - **Alertas que no parpadean:** persistencia e histéresis; `STALE` si la telemetría deja de llegar y `?` cuando algo importante no se puede medir.
 - **Procesos:** un clic abre el cajón con los mayores consumidores de CPU y RAM; dos clics detienen el que está frenando todo (SIGTERM y, si se resiste, SIGKILL).
 - **Seguridad:** LUKS sobre `/`, firewall (ufw, firewalld, nftables o iptables), USBGuard y reinicio pendiente tras actualizar el kernel.
@@ -48,6 +49,18 @@ cd archmonitor
 Después: clic derecho en el escritorio → *Añadir elementos gráficos* → **Archmonitor**. Arrastralo a una esquina.
 
 Para actualizar: `git pull && ./install.sh && systemctl --user restart plasma-plasmashell`.
+
+### Ventana de carga (opcional, requiere root una vez)
+
+Los umbrales de carga (`charge_control_*_threshold`) sólo los escribe root. El widget no lo hace por su cuenta: llama, vía `pkexec`, a un ayudante que valida cada valor. Se instala desde el repo:
+
+```bash
+sudo ./install-battery-helper.sh               # sudo ./install-battery-helper.sh --uninstall para quitarlo
+```
+
+Instala `/usr/local/lib/archmonitor/archmonitor-battery`, la regla de polkit `io.arquimedes.archmonitor.battery` (el usuario sentado frente a la máquina no necesita contraseña; cualquier otro, administrador) y `archmonitor-battery.service`, que reaplica la ventana guardada en `/etc/archmonitor/battery.conf` en cada arranque. La primera vez guarda la ventana que ya esté vigente. Sin el ayudante, la ventana se muestra pero no se puede cambiar.
+
+Un único dueño de los umbrales: si otro servicio también los fija al arrancar (uno propio, TLP, o el *Límite de carga* de Plasma), pisa lo que elijas en el widget. El instalador avisa si encuentra `battery-care.service` o TLP.
 
 `install.sh` además avisa qué dependencias opcionales faltan, borra la caché de QML y retira un Conky previo. `./package.sh` arma el `.plasmoid` en `dist/` (sólo `metadata.json`, `contents/` y la licencia).
 
@@ -89,6 +102,7 @@ El aviso de reinicio pendiente depende del empaquetado de kernels de Arch (`pkgb
 | `contents/ui/Card.qml` | Tarjeta del escritorio. Vista pura; un clic abre o cierra el cajón de detalle bajo el encabezado. |
 | `contents/ui/Detail.qml` | Contenido del cajón: alertas activas, procesos por CPU y RAM, kernel. Sin fondo propio: es parte de la tarjeta. |
 | `contents/ui/Logic.js` | Umbrales, formato y motor de alertas (persistencia + histéresis). |
+| `extras/battery/` + `install-battery-helper.sh` | Opcional: ayudante root, regla polkit y servicio de arranque para la ventana de carga. No va dentro del `.plasmoid`. |
 | `tests/` | `test_logic.js` (motor), `test_probe.sh` (sonda) y `test_hw.sh` (hardware y seguridad de otras máquinas). |
 
 ## Semántica
@@ -119,19 +133,20 @@ El aviso de reinicio pendiente depende del empaquetado de kernels de Arch (`pkgb
 - **Fila contextual** (altura fija, la tarjeta nunca cambia de tamaño): `FAN` en ámbar cuando la CPU ≥ 70 °C (sale bajo 65 °C) o el ventilador supera 4000 rpm; si no, `SOC` (potencia del paquete APU), tenue en reposo y normal en batería, cargando o por encima de 15 W (sale bajo 12 W). En un equipo sin sensor de ventilador ni potencia de paquete la fila no se reserva.
 - **Red**: se toma el enlace físico, la ruta por defecto activa (`RTF_UP`) de menor métrica en `/proc/net/route` (Ethernet del dock a métrica 100 gana al Wi-Fi a 600). Los túneles VPN enrutan por otras tablas y no se eligen a propósito: SSID y señal son del enlace físico.
 - **SSID**: `iw` escapa los bytes no ASCII como `\xNN`; se decodifican, así que «Señal» se ve bien. Todo texto pasa por un escape JSON completo (incluye caracteres de control).
-- **Batería**: `Not charging` con umbral de carga (ThinkPad, ASUS y otros con `charge_control_end_threshold`) se muestra como `AC · held at N%`.
+- **Batería**: `Not charging` con umbral de carga (ThinkPad, ASUS y otros con `charge_control_end_threshold`) se muestra como `AC · held at N%` al llegar al fin, y `AC · charges below N%` por encima del inicio.
+- **Ventana de carga**: la barra de batería marca inicio y fin con dos trazos finos. Un clic en la sección muestra dos manijas que se arrastran en pasos de 5 %: inicio 0–95 %, fin 50–100 %, al menos 5 % entre ambos; una manija se detiene contra la otra. Al soltar se guarda y aplica. Un fin por debajo de 50 % no se acepta, para que un desliz no deje la máquina sin poder cargar antes de un viaje. `CHARGE TO 100%` aplica 99–100 % sin tocar la ventana guardada; se desactiva con el mismo botón o al reiniciar. Si polkit lo rechaza la tarjeta dice `not authorised` y vuelve al estado real. Las escrituras siguen el orden que exige el kernel (al subir por encima del fin vigente se escribe primero el fin).
 
 Los umbrales se ajustan en `Logic.js` (`TH`, `RULES`, `UP`). Para aplicar cambios: `./install.sh` y reiniciar plasmashell.
 
 ## Pruebas
 
 ```bash
-node tests/test_logic.js     # 42 casos: persistencia, histéresis, política de seguridad, STALE, desconocidos, vistas, señales, música
+node tests/test_logic.js     # 46 casos: persistencia, histéresis, política de seguridad, STALE, desconocidos, vistas, señales, música
 bash tests/test_probe.sh     # 42 casos: LUKS, reinicio, ruta, SSID/escape, top, kill, música, JSON, uptime
-bash tests/test_hw.sh        # 28 casos: portátil AMD, Intel (i915/xe), escritorio armado, NVIDIA híbrida, ARM, VM, Wi-Fi sin iw, firewalls
+bash tests/test_hw.sh        # 52 casos: portátil AMD, Intel (i915/xe), escritorio armado, NVIDIA híbrida, ARM, VM, Wi-Fi sin iw, firewalls, ventana de carga
 ```
 
-`test_hw.sh` arma árboles `/sys` falsos de máquinas distintas y un `systemctl` falso. La sonda acepta `ARCHI_SYS`, `ARCHI_SYSBLK`, `ARCHI_ROOT_DEV`, `ARCHI_MODDIR`, `ARCHI_SYSTEMCTL`, `ARCHI_NVSMI`, `ARCHI_ROUTE`, `ARCHI_IW_FILE`, `ARCHI_WIRELESS` y `ARCHI_MEDIA_FILE` para apuntar a datos de prueba. No se usan en producción.
+`test_hw.sh` arma árboles `/sys` falsos de máquinas distintas y un `systemctl` falso. La sonda acepta `ARCHI_SYS`, `ARCHI_SYSBLK`, `ARCHI_ROOT_DEV`, `ARCHI_MODDIR`, `ARCHI_SYSTEMCTL`, `ARCHI_NVSMI`, `ARCHI_PKEXEC`, `ARCHI_BATHELPER`, `ARCHI_BATCONF`, `ARCHI_ROUTE`, `ARCHI_IW_FILE`, `ARCHI_WIRELESS` y `ARCHI_MEDIA_FILE` para apuntar a datos de prueba. No se usan en producción.
 
 ## Licencia
 

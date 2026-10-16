@@ -1,7 +1,7 @@
 // Alert engine tests. Run: node tests/test_logic.js
 const fs = require('fs'), path = require('path'), assert = require('assert');
 const src = fs.readFileSync(path.join(__dirname, '../contents/ui/Logic.js'), 'utf8').replace(/^\.pragma library.*$/m, '');
-const L = new Function(src + '; return { TH, UP, contextRowUsed, secView, gpuView, degOpt, FAST_STALE_MS, SEC_STALE_MS, TERM_GRACE_MS, TERM_WINDOW_MS, derive, evaluate, present, contextRow, freshState, batteryLine, rate, dur, killSignal, killPending, killCommand, mediaView, mediaCommand, keepArt };')();
+const L = new Function(src + '; return { TH, UP, WIN, batteryView, clampWindow, batteryCommand, batteryError, contextRowUsed, secView, gpuView, degOpt, FAST_STALE_MS, SEC_STALE_MS, TERM_GRACE_MS, TERM_WINDOW_MS, derive, evaluate, present, contextRow, freshState, batteryLine, rate, dur, killSignal, killPending, killCommand, mediaView, mediaCommand, keepArt };')();
 
 const base = () => ({
     ts: 1, host: 'archi', mem_total: 28e6, mem_avail: 15e6, fs_blocks: 100, fs_free: 50, fs_avail: 50, fs_bsize: 4096,
@@ -294,6 +294,45 @@ t('contextRow: APU package power shown, a discrete card\'s board power not; no F
 t('degOpt: blank for a sensor the machine does not have', () => {
     assert.strictEqual(L.degOpt(null), '');
     assert.strictEqual(L.degOpt(41000), '41°C');
+});
+
+// ── Battery charge window ────────────────────────────────────────────────────
+t('batteryView: window, full-charge detection, read-only', () => {
+    const b = o => L.batteryView(Object.assign(base(), o));
+    assert.strictEqual(b({ bat_limit: null }).show, false, 'no thresholds: nothing to open');
+    const care = b({ bat_limit: 80, bat_start: 40, bat_ctl: true, care_start: 40, care_end: 80 });
+    assert.deepStrictEqual([care.show, care.ctl, care.full, care.start, care.end], [true, true, false, 40, 80]);
+    const full = b({ bat_limit: 100, bat_start: 99, bat_ctl: true, care_start: 40, care_end: 80 });
+    assert.deepStrictEqual([full.full, full.start, full.end], [true, 40, 80], 'full charge shows the saved window');
+    assert.strictEqual(b({ bat_limit: 100, bat_start: 0, bat_ctl: true, care_start: 0, care_end: 100 }).full, false, 'a chosen 100 % is not "full charge"');
+    const ro = b({ bat_limit: 80, bat_start: 40 });
+    assert.deepStrictEqual([ro.ctl, ro.start, ro.end], [false, 40, 80], 'without the helper: current thresholds, read-only');
+    assert.deepStrictEqual([b({ bat_limit: 80, bat_start: null }).hasStart, L.batteryView({}).end], [false, 100]);
+});
+t('clampWindow: 5 % steps, limits, the moved handle stops at the other', () => {
+    const c = (s, e, m) => { const w = L.clampWindow(s, e, m); return [w.start, w.end]; };
+    assert.deepStrictEqual(c(41.2, 78.9, 'end'), [40, 80]);
+    assert.deepStrictEqual(c(40, 30, 'end'), [40, 50], 'end never below 50');
+    assert.deepStrictEqual(c(90, 60, 'start'), [55, 60], 'start stops 5 below end');
+    assert.deepStrictEqual(c(98, 100, 'start'), [95, 100], 'start at most 95');
+    assert.deepStrictEqual(c(70, 72, 'end'), [70, 75], 'end stops 5 above start');
+    assert.deepStrictEqual(c(-5, 120, 'end'), [0, 100]);
+});
+t('batteryCommand: validated commands only', () => {
+    const p = "bash '/p/archi-stat.sh'";
+    assert.strictEqual(L.batteryCommand(p, 'set', 40, 80), p + ' bat-set 40 80');
+    assert.strictEqual(L.batteryCommand(p, 'full'), p + ' bat-full');
+    assert.strictEqual(L.batteryCommand(p, 'care'), p + ' bat-care');
+    for (const [s, e] of [[40, 45.5], [40, 40], [96, 100], [0, 45], ['40', 80], [-1, 80], [40, 101]])
+        assert.strictEqual(L.batteryCommand(p, 'set', s, e), '', `${s}-${e} rejected`);
+    assert.strictEqual(L.batteryCommand(p, 'rm -rf', 40, 80), '');
+    assert.strictEqual(L.batteryError(126), 'not authorised');
+    assert.strictEqual(L.batteryError(127), 'helper not installed');
+});
+t('batteryLine: on AC above the start threshold, says when it will charge', () => {
+    assert.strictEqual(L.batteryLine({ bat_status: 'Not charging', bat_cap: 62, bat_limit: 80, bat_start: 40 }), 'AC · charges below 40%');
+    assert.strictEqual(L.batteryLine({ bat_status: 'Not charging', bat_cap: 79, bat_limit: 80, bat_start: 40 }), 'AC · held at 80%');
+    assert.strictEqual(L.batteryLine({ bat_status: 'Not charging', bat_cap: 62, bat_limit: 80 }), 'AC · idle');
 });
 
 console.log(`${n} passed`);

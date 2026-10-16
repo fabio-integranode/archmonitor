@@ -29,6 +29,8 @@ Item {
     property var media: null        // `archi-stat.sh media` snapshot
     property real mediaAt: 0        // ms, when it arrived
     signal mediaAction(string action)   // play-pause | next | previous | raise
+    property var batResult: null    // last bat-* result {action, ok, code, at}
+    signal batteryAction(string action, int start, int end)   // set | full | care
 
     // ── Design tokens ────────────────────────────────────────────────────────
     readonly property string sans: "Inter"
@@ -70,6 +72,28 @@ Item {
     readonly property var secItems: L.secView(sec, policy, secFresh, lv("reboot") > 0)
     readonly property var gv: L.gpuView(s)
     readonly property bool hasBattery: !live || L.has(s.bat_cap)
+
+    // Battery charge window. `edit` is the window being dragged, then the one sent, until
+    // the probe reports it (or 8 s pass, or the helper says no); `fullWant` likewise for
+    // the full-charge switch. Both are view state only.
+    readonly property var bv: L.batteryView(s)
+    property bool batOpen: false
+    property var edit: null             // {start, end, at}
+    property var fullWant: null         // {on, at}
+    readonly property var win: edit ? edit : { start: bv.start, end: bv.end }
+    readonly property bool fullOn: fullWant ? fullWant.on : !!bv.full
+    readonly property bool batBusy: !!edit && edit.at > 0 || !!fullWant
+    readonly property string batNote: {
+        if (batResult && !batResult.ok && now - batResult.at < 6000) return L.batteryError(batResult.code)
+        if (batBusy) return "applying…"
+        if (fullOn) return "until reboot"
+        return ""
+    }
+    onSChanged: {
+        if (edit && edit.at > 0 && ((s.care_start === edit.start || !bv.hasStart) && s.care_end === edit.end || now - edit.at > 8000)) edit = null
+        if (fullWant && (!!bv.full === fullWant.on || now - fullWant.at > 8000)) fullWant = null
+    }
+    onBatResultChanged: if (batResult && !batResult.ok) { edit = null; fullWant = null }
 
     implicitWidth: 272
     implicitHeight: col.implicitHeight + 2 * pad
@@ -131,6 +155,97 @@ Item {
             opacity: parent.level ? 1 : 0.55
             Behavior on width { NumberAnimation { duration: 700; easing.type: Easing.OutCubic } }
             Behavior on color { ColorAnimation { duration: 400 } }
+        }
+    }
+
+    // Battery bar with the charge window: thin ticks at start and end when idle; with
+    // `editing`, a faint band and two handles that drag in 5 % steps. Dragging only moves
+    // the shown window (card.edit); releasing sends it.
+    component WindowBar: Item {
+        id: wb
+        property real level: 0
+        property int levelTone: 0
+        property bool marks: false
+        property int start: 0
+        property int end: 100
+        property bool hasStart: true
+        property bool editing: false
+        property bool dim: false
+        implicitHeight: editing ? 18 : 2
+        Behavior on implicitHeight { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+        readonly property real cy: height / 2
+        function px(p) { return Math.round(width * p / 100) }
+
+        Rectangle { x: 0; width: parent.width; y: wb.cy - 1; height: 2; radius: 1; color: card.cTrack }
+        Rectangle {           // the window band
+            visible: wb.editing
+            x: wb.px(wb.hasStart ? wb.start : 0); width: wb.px(wb.end) - x
+            y: wb.cy - 3; height: 6; radius: 3
+            color: Qt.rgba(card.cAccent.r, card.cAccent.g, card.cAccent.b, wb.dim ? 0.08 : 0.18)
+        }
+        Rectangle {           // charge level
+            x: 0; y: wb.cy - 1; height: 2; radius: 1
+            width: parent.width * Math.max(0, Math.min(1, wb.level))
+            color: card.tone(wb.levelTone, card.cBar)
+            opacity: wb.levelTone ? 1 : 0.55
+            Behavior on width { NumberAnimation { duration: 700; easing.type: Easing.OutCubic } }
+        }
+        Repeater {            // ticks (idle)
+            model: wb.marks && !wb.editing ? (wb.hasStart && wb.start > 0 ? [wb.start, wb.end] : [wb.end]) : []
+            Rectangle {
+                required property int modelData
+                visible: modelData > 0 && modelData < 100
+                x: wb.px(modelData) - 0.5; width: 1
+                y: wb.cy - 3; height: 6
+                color: wb.dim ? card.cTrack : card.cFaint
+            }
+        }
+        Repeater {            // handles (editing)
+            model: wb.editing ? (wb.hasStart ? ["start", "end"] : ["end"]) : []
+            Rectangle {
+                required property string modelData
+                readonly property int v: modelData === "start" ? wb.start : wb.end
+                width: 12; height: 12; radius: 6
+                x: wb.px(v) - 6; y: wb.cy - 6
+                color: drag.grab === modelData ? card.cAccent : card.cFg
+                border.width: 2
+                border.color: Qt.rgba(L.C.surface[0], L.C.surface[1], L.C.surface[2], 1)
+                opacity: wb.dim ? 0.5 : 1
+            }
+        }
+        MouseArea {
+            id: drag
+            objectName: "windowDrag"
+            anchors.fill: parent
+            anchors.leftMargin: -8; anchors.rightMargin: -8
+            enabled: wb.editing
+            preventStealing: true
+            cursorShape: enabled ? Qt.SizeHorCursor : Qt.ArrowCursor
+            property string grab: ""
+            function at(mx) { return Math.max(0, Math.min(100, (mx - 8) / wb.width * 100)) }
+            function move(mx) {
+                const v = at(mx)
+                const w = L.clampWindow(grab === "start" ? v : card.win.start, grab === "end" ? v : card.win.end, grab)
+                card.edit = { start: wb.hasStart ? w.start : card.win.start, end: w.end, at: 0 }
+            }
+            onPressed: (m) => {
+                const v = at(m.x)
+                grab = !wb.hasStart ? "end"
+                     : Math.abs(v - wb.start) < Math.abs(v - wb.end) ? "start"
+                     : Math.abs(v - wb.start) > Math.abs(v - wb.end) ? "end"
+                     : (v < wb.start ? "start" : "end")
+                move(m.x)
+            }
+            onPositionChanged: (m) => { if (grab) move(m.x) }
+            onReleased: {
+                grab = ""
+                if (!card.edit) return
+                if (card.edit.start === card.bv.start && card.edit.end === card.bv.end && !card.fullOn) { card.edit = null; return }
+                card.edit = { start: card.edit.start, end: card.edit.end, at: card.now }
+                card.fullWant = card.fullOn ? { on: false, at: card.now } : null
+                card.batteryAction("set", card.edit.start, card.edit.end)
+            }
+            onCanceled: { grab = ""; card.edit = null }
         }
     }
 
@@ -360,22 +475,23 @@ Item {
                     renderType: Text.NativeRendering
                 }
                 // Model, then uptime. A long model is cut, never the uptime.
-                RowLayout {
+                Item {
                     Layout.fillWidth: true
-                    spacing: 0
+                    implicitHeight: upNote.implicitHeight
                     Note {
-                        visible: card.live && !!card.s.model
+                        id: modelNote
+                        visible: text !== ""
                         text: card.live && card.s.model ? card.s.model : ""
                         font.pixelSize: 9
                         elide: Text.ElideRight
-                        Layout.fillWidth: true
-                        Layout.maximumWidth: implicitWidth
+                        width: Math.max(0, Math.min(implicitWidth, parent.width - upNote.implicitWidth))
                     }
                     Note {
+                        id: upNote
+                        x: modelNote.visible ? modelNote.width : 0
                         text: !card.live ? "" : (card.s.model ? "  ·  " : "") + "up " + L.dur(card.s.uptime)
                         font.pixelSize: 9
                     }
-                    Item { Layout.fillWidth: true }
                 }
             }
 
@@ -582,7 +698,9 @@ Item {
                 Num { text: " " + L.rate(card.tx); Layout.preferredWidth: 84; horizontalAlignment: Text.AlignRight }
             }
 
-            // Power: only on machines with a battery.
+            // Power: only on machines with a battery. Clicking the section, where the
+            // firmware exposes charge thresholds, opens the charge window: handles on the
+            // bar and a full-charge switch.
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 0
@@ -591,24 +709,122 @@ Item {
                 Gap { h: 20 }
                 Hair {}
                 Gap { h: 16 }
-                RowLayout {
+                Item {
+                    id: batBlock
+                    objectName: "battery"
                     Layout.fillWidth: true
-                    spacing: 0
-                    Label { text: "BATTERY"; Layout.fillWidth: true; Layout.alignment: Qt.AlignBaseline }
-                    Num {
-                        text: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap + "%" : "—"
-                        font.pixelSize: 16
-                        font.weight: Font.Medium
-                        color: card.tone(card.lv("bat"), card.cFg)
+                    implicitHeight: batCol.implicitHeight
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: card.bv.show
+                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: card.batOpen = !card.batOpen
+                    }
+                    ColumnLayout {
+                        id: batCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top }
+                        spacing: 0
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            Label { text: "BATTERY"; Layout.alignment: Qt.AlignBaseline }
+                            Label {
+                                visible: card.fullOn
+                                text: "FULL CHARGE"
+                                color: card.cAccent
+                                Layout.alignment: Qt.AlignBaseline
+                            }
+                            Item { Layout.fillWidth: true }
+                            Num {
+                                text: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap + "%" : "—"
+                                font.pixelSize: 16
+                                font.weight: Font.Medium
+                                color: card.tone(card.lv("bat"), card.cFg)
+                            }
+                        }
+                        Gap { h: 8 }
+                        WindowBar {
+                            id: wbar
+                            Layout.fillWidth: true
+                            level: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap / 100 : 0
+                            levelTone: card.lv("bat")
+                            marks: card.bv.show
+                            start: card.win.start
+                            end: card.win.end
+                            hasStart: !!card.bv.hasStart
+                            editing: card.batOpen && card.bv.ctl
+                            dim: card.fullOn
+                        }
+                        Gap { h: 8 }
+                        Note { text: card.live ? L.batteryLine(card.s) : ""; Layout.fillWidth: true; elide: Text.ElideRight }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            visible: card.batOpen && card.bv.show
+                            Gap { h: 14 }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 0
+                                Label { text: "CHARGE WINDOW"; Layout.fillWidth: true }
+                                Num {
+                                    text: card.bv.hasStart ? card.win.start + "–" + card.win.end + "%" : "≤ " + card.win.end + "%"
+                                    color: card.fullOn ? card.cFaint : card.cFg
+                                }
+                            }
+                            Gap { h: 12 }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                visible: card.bv.ctl
+                                // Pill switch: charge to 100 % now (a trip later today), or back
+                                // to the window.
+                                Rectangle {
+                                    id: fullBtn
+                                    objectName: "fullCharge"
+                                    implicitWidth: fullLbl.implicitWidth + 22
+                                    implicitHeight: 22
+                                    radius: 11
+                                    readonly property color c: card.fullOn ? card.cAccent : card.cSub
+                                    color: Qt.rgba(c.r, c.g, c.b, card.fullOn ? 0.16 : (fullArea.containsMouse ? 0.10 : 0.04))
+                                    border.width: 1
+                                    border.color: Qt.rgba(c.r, c.g, c.b, card.fullOn ? 0.55 : 0.28)
+                                    Behavior on color { ColorAnimation { duration: 150 } }
+                                    Label {
+                                        id: fullLbl
+                                        anchors.centerIn: parent
+                                        text: card.fullOn ? "FULL CHARGE · ON" : "CHARGE TO 100%"
+                                        color: fullBtn.c
+                                    }
+                                    MouseArea {
+                                        id: fullArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            const on = !card.fullOn
+                                            card.fullWant = { on: on, at: card.now }
+                                            card.batteryAction(on ? "full" : "care", 0, 0)
+                                        }
+                                    }
+                                }
+                                Item { Layout.fillWidth: true }
+                                Note {
+                                    text: card.batNote
+                                    font.pixelSize: 9
+                                    color: card.batResult && !card.batResult.ok && card.batNote === L.batteryError(card.batResult.code) ? card.cWarn : card.cSub
+                                }
+                            }
+                            Note {
+                                visible: !card.bv.ctl
+                                text: "Read-only: battery helper not installed"
+                                font.pixelSize: 9
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                        }
                     }
                 }
-                Gap { h: 8 }
-                Bar {
-                    frac: card.live && L.has(card.s.bat_cap) ? card.s.bat_cap / 100 : 0
-                    level: card.lv("bat")
-                }
-                Gap { h: 8 }
-                Note { text: card.live ? L.batteryLine(card.s) : ""; Layout.fillWidth: true; elide: Text.ElideRight }
             }
 
             Gap { h: 20 }

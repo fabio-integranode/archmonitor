@@ -1,0 +1,12 @@
+[Unit]
+Description=Archmonitor: apply the saved battery charge window
+After=systemd-modules-load.service
+ConditionPathExists=/etc/archmonitor/battery.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/archmonitor/archmonitor-battery care
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
