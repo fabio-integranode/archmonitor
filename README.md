@@ -3,9 +3,12 @@
 Monitor de recursos nativo para **KDE Plasma 6** (Wayland): una tarjeta sobria en el escritorio que se queda en silencio mientras todo está bien y avisa solo cuando algo se sale de rango.
 
 <p align="center">
-  <img src="docs/escritorio.png" alt="Archmonitor en el escritorio, con música del navegador" width="300">
-  <img src="docs/sobrecarga.png" alt="Sobrecarga: el cajón muestra el proceso culpable, listo para detenerlo" width="300">
+  <a href="docs/archmonitor-reel.mp4"><img src="docs/archmonitor-reel-preview.gif" alt="Sobrecarga, diagnóstico y vuelta a NOMINAL (clic para ver el video completo)" width="240"></a>
+  <img src="docs/escritorio.png" alt="Archmonitor en el escritorio, con música del navegador" width="240">
+  <img src="docs/sobrecarga.png" alt="Sobrecarga: el cajón muestra el proceso culpable, listo para detenerlo" width="240">
 </p>
+
+<p align="center"><a href="docs/archmonitor-reel.mp4"><b>▶ Ver el video completo (27 s)</b></a></p>
 
 - **Sistema:** CPU, RAM, GPU y disco, con temperaturas, potencia del SoC y ventilador cuando hace falta.
 - **Red y batería:** enlace físico, señal Wi-Fi y tasas; carga, potencia y tiempo restante.
